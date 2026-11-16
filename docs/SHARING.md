@@ -28,7 +28,7 @@ The public repository's CI uses a full checkout and runs both checks, including
 commit/tag identities. Always run the history check locally **after committing
 and before pushing** as well: CI only runs after upload and cannot prevent a
 private address being disclosed in the first place. GitHub-provided noreply
-identities and the exact public GitHub system committer identity are permitted;
+identities and the exact public GitHub committer/Dependabot service identities are permitted;
 ordinary personal addresses are not.
 
 Do not force-add data or secrets, and do not use a generic recursive zip/tar of
