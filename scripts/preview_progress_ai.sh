@@ -5,6 +5,15 @@ if [[ ${EUID} -ne 0 ]]; then
     echo 'Run this preview with sudo.' >&2
     exit 1
 fi
+# When operational API checks are configured, preview the same evidence as the
+# scheduled report. systemd passes the API credential without exposing .secrets.
+api_properties=()
+if [[ -f /etc/ojs-api/progress-api.env ]]; then
+    api_properties+=(
+        --property=EnvironmentFile=/etc/ojs-api/progress-api.env
+        --property=LoadCredential=api-client.env:/srv/ojs_api/.secrets/api-client.env
+    )
+fi
 # Let systemd allocate a fresh transient unit name. A failed preview's unit can
 # remain loaded despite --collect; the report flock still prevents overlap.
 exec systemd-run --quiet --collect --wait --pipe \
@@ -24,4 +33,5 @@ exec systemd-run --quiet --collect --wait --pipe \
     --property=MemoryMax=96M --property=TasksMax=16 \
     --property=Nice=19 --property=CPUWeight=1 --property=IOWeight=1 \
     --property=TimeoutStartSec=180 \
+    "${api_properties[@]}" \
     /usr/bin/python3 -B /srv/ojs_api/src/email_progress.py --preview-llm

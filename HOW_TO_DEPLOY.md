@@ -43,6 +43,12 @@ fits beside it. Keep automatic updates paused until capacity is established.
    resource headroom and recoverable backups.
 8. Enable daily source checks/builds only after reviewing next-build capacity.
 
+Use `sudo ./scripts/install_automatic_updates.sh` to stage the updater **paused**
+without starting it. Set a reviewed `OJS_BUILD_WORKSPACE_GB` budget (and scratch
+budget if configured), then use `make automatic-readiness` as the deployment
+account. Follow the [separate activation checklist](docs/OPERATIONS.md#activate-only-after-review)
+only after storage, backups, service overrides and readiness have been reviewed.
+
 Do not start `docker compose up` against an absent `mysql-live` pointer: MySQL
 could initialise an empty database. The publication coordinator owns directory
 selection, cold validation, the switch and rollback on failed checks.

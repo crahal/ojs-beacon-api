@@ -1,0 +1,41 @@
+[Unit]
+Description=Notify configured recipients when OJS snapshot %i starts processing
+After=network-online.target
+RequiresMountsFor=/srv/ojs_api/data
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/usr/local/lib/ojs-api-monitor
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# Install a private instance override for the selected recipient names.
+EnvironmentFile=/etc/ojs-api/processing-start.env
+# The root watcher and imports must be an administrator-owned, read-only bundle,
+# never executable Python from the ojs-writable application checkout.
+ExecStart=/usr/bin/python3 /usr/local/lib/ojs-api-monitor/scripts/watch_processing_start.py --snapshot %i --recipient primary --recipient ${OJS_PROGRESS_START_SUBSCRIBER}
+StateDirectory=ojs-api-start-notice
+StateDirectoryMode=0755
+UMask=0077
+TimeoutStartSec=15min
+MemoryMax=96M
+TasksMax=16
+Nice=19
+CPUWeight=1
+IOWeight=1
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock /srv/ojs_api/.env /srv/ojs_api/.secrets /etc/ojs-api/progress-email-password /etc/ojs-api/progress-openai-key
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+# Read per-recipient SMTP receipts in the ojs-owned 0700 reporting directory.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+

@@ -74,8 +74,8 @@ class RecipientTests(unittest.TestCase):
                 if not expected:
                     self.assertEqual(before, self.subscriber.read_bytes())
 
-    def test_primary_default_guard_remains_eleven_hours(self):
-        for hours, expected in ((10, False), (11, True)):
+    def test_primary_default_guard_is_three_days(self):
+        for hours, expected in ((11, False), (71, False), (72, True)):
             self.save(self.primary, timedelta(hours=hours))
             code, _, _, send, _ = self.run_report(self.primary)
             self.assertEqual(code, 0)

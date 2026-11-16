@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import download_beacon
 import publish_live
 import run_pipeline
+from build_baseline import assert_automatic_baseline
+from build_budget import build_budget, existing_lock_busy
+from mount_safety import assert_cleanup_unmounted
 from progress_logging import Progress, progress_interval
 from source_activity import SourceActivityBusy, source_activity, source_activity_child_options
 
@@ -264,6 +268,8 @@ class Coordinator:
     def capacity(self, minimum: float) -> None:
         path = self.clean if self.clean.exists() else self.root
         paths = [("data", path)]
+        if self.raw.exists() and self.raw.stat().st_dev != path.stat().st_dev:
+            paths.append(("raw", self.raw))
         scratch = run_pipeline.mysql_scratch_root(
             configured=self.env.get("OJS_MYSQL_TMP_ROOT", ""),
         )
@@ -281,8 +287,165 @@ class Coordinator:
             raise UpdateError("OJS_MIN_AVAILABLE_MEMORY_MB must be nonnegative")
         memory = Path("/proc/meminfo").read_text()
         available = re.search(r"^MemAvailable:\s+(\d+) kB$", memory, re.MULTILINE)
+        if available is None:
+            raise UpdateError("host available memory measurement is unavailable")
         if available and int(available.group(1)) < minimum_mb * 1024:
             raise UpdateError(f"less than {minimum_mb} MiB memory is available for the build")
+
+    def build_capacity(self, probe: dict, *, downloaded: bool = False) -> dict:
+        scratch = run_pipeline.mysql_scratch_root(
+            configured=self.env.get("OJS_MYSQL_TMP_ROOT", ""))
+        return build_budget(
+            clean=self.clean, raw=self.raw, scratch=scratch, env=self.env,
+            needs_download=probe["needs_download"] and not downloaded,
+            remote_size=probe.get("remote", {}).get("size"),
+            reserve_gib=self.args.reserve_gb, minimum_gib=self.args.min_free_gb)
+
+    def require_build_capacity(self, probe: dict, *, downloaded: bool = False) -> None:
+        report = self.build_capacity(probe, downloaded=downloaded)
+        print(json.dumps({"event": "build-capacity", **report}, sort_keys=True))
+        if not report["approved"]:
+            raise UpdateError("automatic build not admitted: " + ", ".join(report["blockers"]) +
+                              "; review the working-space budget; live database retained")
+
+    def incomplete_builds(self) -> None:
+        for staging in self.clean.glob("mysql-????-??-??.building"):
+            safe_child(self.clean, staging.name)
+            state = run_pipeline.read_build_state(staging)
+            if state is None or state.get("phase") != "metadata_ready":
+                raise UpdateError("incomplete build requires manual recovery; candidate retained; no download started")
+
+    def scheduler_status(self) -> dict:
+        """Small allowlisted systemd observations; never read unit environments."""
+        status = {"cron_installed": Path("/etc/cron.d/ojs-api").is_file(),
+                  "cron_matches_template": False, "cron_active": None,
+                  "timezone_utc": None,
+                  "service_loaded": None, "manual_start_refused": None,
+                  "service_active": None, "timer_enabled": None}
+        descriptor = None
+        try:
+            descriptor = os.open("/etc/cron.d/ojs-api", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            info = os.fstat(descriptor)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022 and info.st_size <= 16384:
+                with os.fdopen(descriptor, "rb") as source:
+                    descriptor = None
+                    actual = source.read(16385)
+                with (self.root / "deploy/ojs-api.cron").open("rb") as source:
+                    expected = source.read(16385)
+                status["cron_matches_template"] = bool(expected) and len(expected) <= 16384 and actual == expected
+        except OSError:
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        try:
+            output = self.command(["systemctl", "show", "ojs-api-update.service",
+                                   "-p", "LoadState", "-p", "RefuseManualStart",
+                                   "-p", "ActiveState"], timeout=5)
+            fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+            status["service_loaded"] = fields.get("LoadState") == "loaded"
+            status["manual_start_refused"] = (
+                fields["RefuseManualStart"] == "yes" if fields.get("RefuseManualStart") in ("yes", "no") else None)
+            state = fields.get("ActiveState")
+            if state in ("active", "activating", "deactivating", "reloading", "refreshing", "maintenance"):
+                status["service_active"] = True
+            elif state in ("inactive", "failed"):
+                status["service_active"] = False
+            timer = self.command(["systemctl", "show", "ojs-api-update.timer",
+                                  "-p", "ActiveState", "-p", "UnitFileState"], timeout=5)
+            timer_fields = dict(line.split("=", 1) for line in timer.splitlines() if "=" in line)
+            timer_active = timer_fields.get("ActiveState")
+            timer_file = timer_fields.get("UnitFileState")
+            if (timer_active in ("active", "activating", "deactivating", "reloading", "refreshing", "maintenance") or
+                    timer_file in ("enabled", "enabled-runtime", "linked", "linked-runtime")):
+                status["timer_enabled"] = True
+            elif timer_active in ("inactive", "failed") and timer_file in ("", "disabled", "static", "masked", "masked-runtime"):
+                status["timer_enabled"] = False
+            cron = self.command(["systemctl", "show", "cron.service", "-p", "ActiveState", "--value"], timeout=5).strip()
+            status["cron_active"] = cron == "active" if cron in ("active", "inactive", "failed", "activating", "deactivating") else None
+            timezone = self.command(["timedatectl", "show", "-p", "Timezone", "--value"], timeout=5).strip()
+            status["timezone_utc"] = timezone in ("UTC", "Etc/UTC") if timezone else None
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return status
+
+    def readiness(self) -> dict:
+        """No files, databases, downloads, service starts, mail or paid API calls."""
+        blockers = []
+        report = {"schema_version": 1, "live_snapshot": None, "baseline_snapshot": None,
+                  "updates_paused": (self.root / "data" / PAUSE_MARKER).exists() or
+                                    (self.root / "data" / PAUSE_MARKER).is_symlink(),
+                  "recovery_pending": self.journal.exists() or self.journal.is_symlink()}
+        live = None
+        try:
+            live = live_directory(self.clean)
+            report["live_snapshot"] = live.name.removeprefix("mysql-") if live else None
+            report["baseline_snapshot"] = assert_automatic_baseline(self.clean, live)
+        except (OSError, RuntimeError, ValueError):
+            blockers.append("history_baseline_unavailable")
+        if report["recovery_pending"]:
+            blockers.append("publication_recovery_pending")
+        try:
+            self.incomplete_builds()
+        except (OSError, RuntimeError, ValueError):
+            blockers.append("incomplete_build_requires_review")
+        for code, path in (
+            ("source_activity", self.raw / ".source-activity.lock"),
+            ("automatic_update", self.clean / ".automatic-update.lock"),
+            ("pipeline", self.clean / ".pipeline.lock"),
+            ("publication", self.clean / ".publish-live.lock"),
+        ):
+            try:
+                if existing_lock_busy(path):
+                    blockers.append(code + "_busy")
+            except OSError:
+                blockers.append(code + "_unavailable")
+        for code, check in (("mysql_tools_incompatible", self.compatible_mysql_tools),
+                            ("api_credentials_unavailable", self.credentials),
+                            ("host_memory_unavailable", self.memory_capacity)):
+            try:
+                check()
+            except (OSError, RuntimeError, ValueError):
+                blockers.append(code)
+        if not self.env.get("MYSQL_ROOT_PASSWORD"):
+            blockers.append("database_credentials_unset")
+        try:
+            probe = self.probe()
+            report["source"] = {"needs_download": probe["needs_download"],
+                                "date_hint": probe.get("date_hint"),
+                                "compressed_bytes": probe.get("remote", {}).get("size")}
+            report["capacity"] = self.build_capacity(probe)
+            blockers.extend(report["capacity"]["blockers"])
+        except (OSError, RuntimeError, ValueError, TypeError):
+            blockers.append("source_or_capacity_check_unavailable")
+        report["build_blockers"] = list(dict.fromkeys(blockers))
+        report["ready_for_build"] = not blockers
+        scheduler = self.scheduler_status()
+        report["scheduler"] = scheduler
+        activation = []
+        if report["updates_paused"]:
+            activation.append("updates_paused")
+        if scheduler["service_loaded"] is not True:
+            activation.append("service_not_confirmed_loaded")
+        if scheduler["manual_start_refused"] is not False:
+            activation.append("manual_start_not_permitted")
+        if scheduler["service_active"] is not False:
+            activation.append("service_not_confirmed_idle")
+        if scheduler["timer_enabled"] is not False:
+            activation.append("alternate_scheduler_requires_review")
+        if not scheduler["cron_installed"]:
+            activation.append("daily_cron_not_installed")
+        elif scheduler.get("cron_matches_template") is not True:
+            activation.append("daily_cron_requires_review")
+        if scheduler.get("cron_active") is not True:
+            activation.append("cron_daemon_not_confirmed_active")
+        if scheduler.get("timezone_utc") is not True:
+            activation.append("utc_schedule_not_confirmed")
+        report["activation_blockers"] = activation
+        report["automatic_updates_allowed"] = not blockers and not activation
+        report["status"] = "blocked" if blockers else "prepared" if activation else "ready"
+        report["note"] = "Point-in-time admission checks only; not a measured peak, API health test or backup verification."
+        return report
 
     def child(self, command, *, stage: str = "update-child") -> None:
         remaining = self.deadline - time.monotonic()
@@ -309,10 +472,21 @@ class Coordinator:
             output = self.command(self.download_command() + ["--check", "--json"])
             try:
                 probe = json.loads(output)
-                if not isinstance(probe.get("needs_download"), bool):
+                if not isinstance(probe, dict) or type(probe.get("needs_download")) is not bool:
                     raise ValueError
+                remote = probe.get("remote", {})
+                if not isinstance(remote, dict):
+                    raise ValueError
+                size = remote.get("size")
+                if size is not None and (type(size) is not int or not 0 < size < 2**63):
+                    raise ValueError
+                date_hint = probe.get("date_hint")
+                if date_hint is not None:
+                    if not isinstance(date_hint, str):
+                        raise ValueError
+                    snapshot_date(date_hint)
                 return probe
-            except (ValueError, TypeError, AttributeError) as exc:
+            except (ValueError, TypeError, AttributeError, argparse.ArgumentTypeError) as exc:
                 raise UpdateError("downloader returned invalid check JSON") from exc
 
     def compose(self, datadir: Path, *arguments: str) -> str:
@@ -574,6 +748,7 @@ class Coordinator:
                 paths.extend((old.export, old.export.with_name(old.export.name + ".sha256")))
                 for path in paths:
                     self.require_unmounted(path)
+                    assert_cleanup_unmounted(path)
                     if path.is_dir():
                         for base, directories, files in os.walk(path, followlinks=False):
                             if any((Path(base) / name).is_symlink() for name in directories + files):
@@ -621,6 +796,7 @@ class Coordinator:
                 if (info.st_dev, info.st_ino) != (entry["device"], entry["inode"]):
                     raise UpdateError(f"cleanup target changed since validation: {path}")
                 self.require_unmounted(path)
+                assert_cleanup_unmounted(path)
                 if entry["directory"]:
                     if not shutil.rmtree.avoids_symlink_attacks:
                         raise UpdateError("safe directory cleanup is unavailable on this platform")
@@ -647,6 +823,8 @@ class Coordinator:
         print(f"[cleanup] removed {audit['deleted_count']} generated artifacts ({audit['deleted_bytes']} bytes)")
 
     def execute(self) -> dict:
+        if self.args.readiness:
+            return self.readiness()
         if self.args.check:
             return {"probe": self.probe(), "live": str(live_directory(self.clean)) if self.clean.exists() and live_directory(self.clean) else None,
                     "recovery_pending": self.journal.exists()}
@@ -695,11 +873,7 @@ class Coordinator:
             if not self.args.publish_only:
                 # Refuse a failed finalization BEFORE even a new download. Only
                 # an explicit, audited recovery or rebuild may dispose of work.
-                for staging in self.clean.glob("mysql-????-??-??.building"):
-                    safe_child(self.clean, staging.name)
-                    state = run_pipeline.read_build_state(staging)
-                    if state is None or state.get("phase") != "metadata_ready":
-                        raise UpdateError("incomplete build requires manual recovery; candidate retained; no download started")
+                self.incomplete_builds()
                 probe = self.probe()
                 current = live_directory(self.clean)
                 known = probe.get("known_snapshot")
@@ -713,8 +887,15 @@ class Coordinator:
                 self.compatible_mysql_tools()
                 self.capacity(self.args.min_free_gb)
                 self.memory_capacity()
+                assert_automatic_baseline(self.clean, current)
+                self.require_build_capacity(probe)
+                self.guard_build_directories()
                 if probe["needs_download"]:
                     self.child(self.download_command(), stage="update-download")
+                # Downloads may take hours; do not rely on the earlier budget
+                # or silently bootstrap if a baseline disappeared meanwhile.
+                assert_automatic_baseline(self.clean, current)
+                self.require_build_capacity(probe, downloaded=True)
                 self.guard_build_directories()
                 self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
                             "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
@@ -747,6 +928,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--url", default=os.getenv("OJS_BEACON_URL", download_beacon.DEFAULT_URL))
     result.add_argument("--credentials-file", type=Path, default=Path(os.getenv("OJS_BEACON_CREDENTIALS_FILE", ".secrets/beacon.ini")))
     modes = result.add_mutually_exclusive_group()
+    modes.add_argument("--readiness", action="store_true", help="read-only automatic-build admission report; never download, publish or unpause")
     modes.add_argument("--check", action="store_true", help="read-only HEAD and local status; no locks or writes")
     modes.add_argument("--publish-only", action="store_true", help="promote the completed pipeline candidate without downloading or building")
     modes.add_argument("--publish-release", type=snapshot_date, metavar="YYYY-MM-DD",
@@ -773,8 +955,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, interrupt)
     try:
         progress_interval()
-        print(json.dumps(Coordinator(args).execute(), sort_keys=True))
-        return 0
+        outcome = Coordinator(args).execute()
+        print(json.dumps(outcome, sort_keys=True))
+        return 3 if args.readiness and not outcome["ready_for_build"] else 0
     except SourceActivityBusy:
         print(json.dumps({"status": "skipped", "reason": "source_activity_busy",
                           "message": "Download or wrangling already in progress; no new download started."}))

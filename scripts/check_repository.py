@@ -44,9 +44,10 @@ ACCOUNT = re.compile(r"\barn:aws(?:-[a-z]+)?:[^:\s]+:[^:\s]*:\d{12}:")
 EXAMPLE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "127.0.0.0/8"))
 EXAMPLE_DOMAINS = {"example.com", "example.org", "example.net", "example.invalid", "example.test"}
-# GitHub uses this public service identity for web/Dependabot committers. Do not
-# allow the whole github.com domain: ordinary personal addresses still fail.
-PUBLIC_SYSTEM_EMAILS = frozenset({"noreply@github.com"})
+# GitHub uses these exact public service identities for web committers and
+# Dependabot's Signed-off-by trailer. Do not allow the whole github.com domain:
+# ordinary personal addresses and lookalike/plus-addressed variants still fail.
+PUBLIC_SYSTEM_EMAILS = frozenset({"noreply@github.com", "support@github.com"})
 GENERIC_USERS = {"user", "username", "example", "ojs", "ubuntu"}
 EXAMPLE_UUIDS = {"00000000-0000-0000-0000-000000000000",
                  "11111111-1111-1111-1111-111111111111"}

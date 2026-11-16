@@ -401,6 +401,19 @@ Preflight alone is insufficient. The updater downloads the available upstream
 snapshot and processes eligible local snapshots; it does not fetch a historical
 archive. Resolve existing failed candidates before starting another run.
 
+Set a reviewed positive `OJS_BUILD_WORKSPACE_GB` in `.env`; if
+`OJS_MYSQL_TMP_ROOT` is configured, set `OJS_BUILD_SCRATCH_GB` as well. These
+additional-workspace budgets are required even for a manual invocation of the
+automatic coordinator; the emergency free-space floor is not enough. Run:
+
+```bash
+sudo -u ojs -H bash -lc 'cd /srv/ojs_api && make automatic-readiness'
+```
+
+Require `ready_for_build=true`, review the separate activation blockers, and
+verify that the service is not prohibited by an old recovery/migration override.
+See [the preparation and activation checklist](docs/OPERATIONS.md#daily-scheduling).
+
 **VM:** after approving capacity, remove only the deliberate pause marker:
 
 ```bash

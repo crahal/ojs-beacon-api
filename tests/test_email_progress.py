@@ -129,7 +129,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(report.parse_events("\n".join(cases), INVOCATION), [])
 
     def test_collects_bounded_current_invocation_tail_and_two_known_filesystems(self):
-        with mock.patch.object(report, "diagnostic", side_effect=[
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", side_effect=[
                 service_text(), journal(remaining_rows=500), "", service_text()]) as diagnostic, \
                 mock.patch.object(report, "free_bytes", return_value=10) as disk, \
                 mock.patch.object(report, "host_memory", return_value={}), \
@@ -148,7 +149,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(disk.call_args_list, [mock.call(Path("/")), mock.call(Path("/project/data"))])
 
     def test_restart_during_collection_excludes_previous_run(self):
-        with mock.patch.object(report, "diagnostic", side_effect=[
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", side_effect=[
                 service_text(), journal(event="failed"), "", service_text(OLD_INVOCATION)]), \
                 mock.patch.object(report, "free_bytes", return_value=10), \
                 mock.patch.object(report, "host_memory", return_value={}):
@@ -165,7 +167,8 @@ class SnapshotTests(unittest.TestCase):
             journal("temporal finalization phase", age=10, step="exact_keys", process_pid=77, process_cpu_seconds=104),
         ])
         history = journal("recovery-metadata-audit", age=4000, event="completed", completed_ranges=32, total_ranges=32)
-        with mock.patch.object(report, "diagnostic", side_effect=[service_text(), tail, history, service_text()]), \
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", side_effect=[service_text(), tail, history, service_text()]), \
                 mock.patch.object(report, "free_bytes", return_value=10), \
                 mock.patch.object(report, "host_memory", return_value={}), \
                 mock.patch.object(report, "utc_now", return_value=NOW):
@@ -175,7 +178,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(current["event"]["step"], "exact_keys")
 
     def test_unavailable_milestone_query_keeps_recent_stage(self):
-        with mock.patch.object(report, "diagnostic", side_effect=[
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", side_effect=[
                 service_text(), journal(remaining_rows=500), report.ReportError(), service_text()]), \
                 mock.patch.object(report, "free_bytes", return_value=10), \
                 mock.patch.object(report, "host_memory", return_value={}):
@@ -185,7 +189,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("milestones unavailable", " ".join(current["warnings"]))
 
     def test_no_invocation_does_not_read_historical_journal(self):
-        with mock.patch.object(report, "diagnostic", return_value="ActiveState=inactive\n") as diagnostic, \
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", return_value="ActiveState=inactive\n") as diagnostic, \
                 mock.patch.object(report, "free_bytes", return_value=10), \
                 mock.patch.object(report, "host_memory", return_value={}):
             current = report.collect_snapshot(Path("/project"))
@@ -193,7 +198,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNone(current["event"])
 
     def test_unavailable_diagnostics_do_not_echo_errors(self):
-        with mock.patch.object(report, "diagnostic", side_effect=OSError(SECRET)), \
+        with mock.patch("progress_activity.collect_activity", return_value={}), \
+                mock.patch.object(report, "diagnostic", side_effect=OSError(SECRET)), \
                 mock.patch.object(report, "free_bytes", return_value=None), \
                 mock.patch.object(report, "host_memory", return_value={}):
             current = report.collect_snapshot(Path("/project"))
@@ -326,7 +332,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_smtp_failure_preserves_last_successful_comparison_state(self):
         self.state.parent.mkdir()
-        report.write_state(self.state, report.comparable_state(snapshot(age=100, remaining_rows=200), NOW - timedelta(hours=12)))
+        report.write_state(self.state, report.comparable_state(snapshot(age=100, remaining_rows=200), NOW - timedelta(hours=73)))
         before = self.state.read_bytes()
         code, output, errors, password, send = self.cli(send_error=smtplib.SMTPAuthenticationError(535, SECRET.encode()))
         self.assertEqual(code, 1)
@@ -337,7 +343,7 @@ class DeliveryTests(unittest.TestCase):
     def test_failure_to_save_after_acceptance_is_reported_honestly(self):
         with mock.patch.object(report, "write_state", side_effect=OSError(SECRET)):
             code, output, errors, password, send = self.cli()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("accepted by SMTP, but comparison state could not be saved", errors)
         self.assertNotIn(SECRET, output + errors)
 
@@ -372,9 +378,9 @@ class DeliveryTests(unittest.TestCase):
         password.assert_not_called()
         send.assert_not_called()
 
-    def test_report_older_than_eleven_hours_is_sent(self):
+    def test_report_older_than_seventy_two_hours_is_sent(self):
         self.state.parent.mkdir()
-        report.write_state(self.state, report.comparable_state(self.current, NOW - timedelta(hours=11, seconds=1)))
+        report.write_state(self.state, report.comparable_state(self.current, NOW - timedelta(hours=72, seconds=1)))
         code, output, errors, password, send = self.cli()
         self.assertEqual(code, 0)
         send.assert_called_once()

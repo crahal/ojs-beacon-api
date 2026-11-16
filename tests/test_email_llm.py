@@ -155,7 +155,7 @@ class IntegrationTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 result, output, password, send, generate = self.run_report("--force", error=error)
                 self.assertEqual(result, 0)
-                self.assertTrue(send.call_args.args[-1].startswith("OJS recovery progress report"))
+                self.assertTrue(send.call_args.args[-1].startswith("OJS API and update progress report"))
                 self.assertIn("Optional AI interpretation unavailable; the recorded report is unaffected.", send.call_args.args[-1])
                 self.assertNotIn(PRIVATE, output)
                 self.assertIn("accepted by SMTP", output)

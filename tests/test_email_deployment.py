@@ -23,7 +23,8 @@ class EmailDeploymentTest(unittest.TestCase):
         self.assertEqual(unit["Service"]["Type"], "oneshot")
         self.assertEqual(
             unit["Service"]["ExecStart"],
-            "/usr/bin/python3 /srv/ojs_api/src/email_progress.py --lock-wait-seconds=60",
+            "/usr/bin/python3 /srv/ojs_api/src/email_progress.py "
+            "--min-send-interval-hours=72 --lock-wait-seconds=60",
         )
         for value in unit["Unit"].values():
             self.assertNotIn("ojs-api-update", value)
@@ -65,16 +66,17 @@ class EmailDeploymentTest(unittest.TestCase):
             "/run/docker.sock", "/var/run/docker.sock",
             "/srv/ojs_api/.env", "/srv/ojs_api/.secrets",
         }.issubset(hidden_paths))
-        self.assertLessEqual(int(service["TimeoutStartSec"]), 180)
+        self.assertEqual(int(service["TimeoutStartSec"]), 300)
         self.assertLessEqual(int(service["TasksMax"]), 16)
         memory_limit = re.fullmatch(r"([1-9][0-9]*)M", service["MemoryMax"])
         self.assertIsNotNone(memory_limit)
         self.assertLessEqual(int(memory_limit[1]), 128)
 
-    def test_twelve_hour_timer_has_no_backlog_or_retry_schedule(self):
+    def test_three_day_timer_has_no_backlog_or_retry_schedule(self):
         timer = configuration("deploy/ojs-api-progress-email.timer")
-        self.assertEqual(timer["Timer"]["OnActiveSec"], "12h")
-        self.assertEqual(timer["Timer"]["OnUnitActiveSec"], "12h")
+        self.assertEqual(timer["Timer"]["OnActiveSec"], "72h")
+        self.assertEqual(timer["Timer"]["OnUnitInactiveSec"], "72h")
+        self.assertNotIn("OnUnitActiveSec", timer["Timer"])
         self.assertEqual(timer["Timer"]["Unit"], "ojs-api-progress-email.service")
         self.assertNotIn("OnCalendar", timer["Timer"])
         self.assertNotIn("OnBootSec", timer["Timer"])
@@ -120,7 +122,9 @@ class EmailDeploymentTest(unittest.TestCase):
         self.assertEqual(properties["LoadCredential"],
                          "openai-api-key:/etc/ojs-api/progress-openai-key")
         self.assertEqual(properties["Environment"], "OJS_PROGRESS_LLM_ENABLED=1")
-        self.assertNotIn("EnvironmentFile", properties)
+        self.assertEqual(properties["EnvironmentFile"], "/etc/ojs-api/progress-api.env")
+        self.assertIn('if [[ -f /etc/ojs-api/progress-api.env ]]; then', script)
+        self.assertIn('LoadCredential=api-client.env:/srv/ojs_api/.secrets/api-client.env', script)
         self.assertNotIn("gmail-app-password", script)
         self.assertNotIn("ojs-api-update", script)
         self.assertIn("--preview-llm", arguments)

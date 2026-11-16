@@ -21,6 +21,14 @@ address. Submit a pull request to
 without write access can fork this public repository and push their branch to
 that fork.
 
+Before opening a public pull request, also enable **Keep my email addresses
+private** and **Block command line pushes that expose my email** in your
+[GitHub email settings](https://github.com/settings/emails). Local Git author
+settings do not control GitHub-generated test-merge commits: those may use your
+account email. Inspect both branch history and the PR's generated merge metadata;
+do not allow a personal address just to make CI pass. Changing settings does not
+remove metadata already published or cached.
+
 This public repository has a clean source-only history. Never mirror-push an
 operational repository, push all of its refs/tags, or merge unrelated private
 history into it. To bring over a fix, apply only the reviewed source diff in
@@ -49,7 +57,13 @@ also run the suite with matching MySQL 8.4.11 `mysqld`, `mysql`, `mysqladmin` an
 Use a disposable environment: fixtures initialize temporary databases and need
 permission to start local processes/sockets. Do not use the production datadir.
 
-CI runs the portable test suite in a Python container without MySQL and builds
+CI scans the source tree and reachable public Git history, including commit/tag
+metadata. Configure a suitable public identity **before committing**, and run
+`make check-history` again after creating your commit and before pushing. A CI
+failure happens after upload; it cannot prevent an initial disclosure or erase
+data already sent to GitHub.
+
+CI also runs the portable test suite in a Python container without MySQL, builds
 the API image separately, and checks known dependency advisories. It does not
 establish full-data capacity, launch AWS
 resources, exercise production TLS, or certify a production release. A passing

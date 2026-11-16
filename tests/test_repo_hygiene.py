@@ -61,10 +61,12 @@ class ContentPolicyTests(unittest.TestCase):
         self.assertEqual(self.kinds("/home/" + "private-person/repository"), {"personal-home-path"})
         self.assertEqual(self.kinds("/Users/" + "private-person/repository"), {"personal-home-path"})
 
-    def test_only_exact_github_system_address_is_allowed(self):
-        self.assertEqual(self.kinds("noreply@github.com"), set())
-        for address in ("privateuser@" + "github.com", "support@" + "github.com",
-                        "noreply+private@" + "github.com", "noreply@" + "github.com.evil"):
+    def test_only_exact_github_system_addresses_are_allowed(self):
+        for address in ("noreply@github.com", "support@github.com"):
+            self.assertEqual(self.kinds(address), set())
+        for address in ("privateuser@" + "github.com", "security@" + "github.com",
+                        "noreply+private@" + "github.com", "support+private@" + "github.com",
+                        "noreply@" + "github.com.evil", "support@" + "github.com.evil"):
             with self.subTest(address=address):
                 self.assertEqual(self.kinds(address), {"non-example-email"})
 
@@ -212,6 +214,13 @@ class GitInspectionTests(unittest.TestCase):
         self.git("config", "user.email", "noreply@github.com")
         (self.root / "README.md").write_text("public documentation\n")
         self.commit("Synthetic automated dependency update")
+        self.assertEqual(self.run_check("--history")[0], 0)
+
+    def test_dependabot_public_signoff_history_passes(self):
+        self.git("config", "user.name", "dependabot[bot]")
+        self.git("config", "user.email", "49699333+dependabot[bot]@users.noreply.github.com")
+        (self.root / "README.md").write_text("public documentation\n")
+        self.commit("Synthetic dependency update\n\nSigned-off-by: dependabot[bot] <support@github.com>")
         self.assertEqual(self.run_check("--history")[0], 0)
 
     def test_history_private_files_not_read(self):

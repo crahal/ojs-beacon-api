@@ -24,6 +24,21 @@ today's files are clean. Findings show type, filename and line, never the matche
 secret/address. Checks are heuristic and deliberately conservative. Manually
 review prose, source/test fixtures and externally stored GitHub content too.
 
+The public repository's CI uses a full checkout and runs both checks, including
+commit/tag identities. Always run the history check locally **after committing
+and before pushing** as well: CI only runs after upload and cannot prevent a
+private address being disclosed in the first place. GitHub-provided noreply
+identities and the exact public GitHub committer/Dependabot service identities are permitted;
+ordinary personal addresses are not.
+
+Set GitHub account email privacy before opening a public PR as well as using a
+noreply local Git identity. GitHub can create a temporary test-merge commit with
+the account email independently of the submitted branch. If CI finds that
+exposure, stop publication, correct the account setting, and review the generated
+metadata again; do not weaken the allowlist. Previously published/cached metadata
+is not erased by a settings change. See [the contribution checklist](../CONTRIBUTING.md)
+and the sensitive-data removal guidance below.
+
 Do not force-add data or secrets, and do not use a generic recursive zip/tar of
 the working directory. `.gitignore` does not remove already tracked content,
 erase history, or configure cloud-sync exclusion. Local operator notes may be

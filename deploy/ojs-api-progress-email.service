@@ -14,14 +14,14 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/ojs-api/progress-email.env
 LoadCredential=gmail-app-password:/etc/ojs-api/progress-email-password
-ExecStart=/usr/bin/python3 /srv/ojs_api/src/email_progress.py --lock-wait-seconds=60
+ExecStart=/usr/bin/python3 /srv/ojs_api/src/email_progress.py --min-send-interval-hours=72 --lock-wait-seconds=60
 StateDirectory=ojs-api-report
 StateDirectoryMode=0700
 UMask=0077
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ojs-api-progress-email
-TimeoutStartSec=180
+TimeoutStartSec=300
 MemoryMax=96M
 TasksMax=16
 Nice=19
