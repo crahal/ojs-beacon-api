@@ -1,0 +1,5 @@
+# Install in ROOT's crontab with sudo crontab -e. Do not enable the timer too.
+# systemd supplies the non-root account, memory limits, logs, and overlap guard.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 3 * * * /usr/bin/systemctl start --no-block ojs-api-update.service

@@ -1,0 +1,17 @@
+# Allowlist the API image context. Local data, credentials, Git history and
+# operator notes must never be sent to the build daemon.
+**
+!Dockerfile
+!requirements.txt
+!src/
+src/**
+!src/*.py
+src/*/**
+!README.md
+!HOW_TO_CALL.md
+!LICENSE
+**/__pycache__/
+**/*.pyc
+**/*.log
+**/.env*
+**/.secrets/
