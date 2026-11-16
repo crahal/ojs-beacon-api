@@ -21,6 +21,14 @@ address. Submit a pull request to
 without write access can fork this public repository and push their branch to
 that fork.
 
+Before opening a public pull request, also enable **Keep my email addresses
+private** and **Block command line pushes that expose my email** in your
+[GitHub email settings](https://github.com/settings/emails). Local Git author
+settings do not control GitHub-generated test-merge commits: those may use your
+account email. Inspect both branch history and the PR's generated merge metadata;
+do not allow a personal address just to make CI pass. Changing settings does not
+remove metadata already published or cached.
+
 This public repository has a clean source-only history. Never mirror-push an
 operational repository, push all of its refs/tags, or merge unrelated private
 history into it. To bring over a fix, apply only the reviewed source diff in
