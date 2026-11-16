@@ -61,6 +61,7 @@ services:
       - "127.0.0.1:${OJS_API_PORT:-8000}:8000"
     environment:
       OJS_API_CREDENTIALS_FILE: /run/secrets/ojs-api-client.env
+      OJS_API_CLIENTS_FILE: ${OJS_API_CLIENTS_FILE:-}
       OJS_ADMIN_EMAIL: ${OJS_ADMIN_EMAIL:?set OJS_ADMIN_EMAIL}
       OJS_PUBLIC_BASE_URL: ${OJS_PUBLIC_BASE_URL:?set OJS_PUBLIC_BASE_URL}
       OJS_DB_HOST: mysql
@@ -75,6 +76,9 @@ services:
     volumes:
       - ${OJS_API_CREDENTIALS_HOST_FILE:-./.secrets/api-client.env}:/run/secrets/ojs-api-client.env:ro
       - ${OJS_DB_API_PASSWORD_FILE:-./.secrets/db-api-password}:/run/secrets/ojs-db-api-password:ro
+      # Mount the dedicated directory, so atomic registry replacement is visible.
+      # Never mount the whole .secrets directory or any invitation directory.
+      - ${OJS_API_CLIENTS_HOST_DIR:-./.secrets/api-clients}:/run/secrets/ojs-api-clients:ro
     read_only: true
     mem_limit: ${OJS_API_MEMORY_LIMIT:-256m}
     memswap_limit: ${OJS_API_MEMSWAP_LIMIT:-384m}

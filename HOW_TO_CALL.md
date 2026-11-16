@@ -28,9 +28,13 @@ curl --proto '=https' --fail --show-error --connect-timeout 10 --max-time 180 \
 
 `curl` prompts for the API key without echoing it. Do not put `username:key` in
 the URL or command line, paste credentials into issues, or enable shell tracing
-around secrets. No public sign-up, per-client account management, or OAuth flow
-is implemented: the deployment currently has one configured Basic credential
-pair. Arrange distribution and rotation with the operator.
+around secrets. There is no public sign-up or OAuth flow. Operators can enable
+individually revocable client accounts using a private registry or HTTPS gateway;
+the original internal credential pair remains supported for monitoring and
+publication. Confirm with the operator that your account is activated before
+testing: merely generating a key does not enable it on a deployed API. See
+[tester access management](docs/TESTER_ACCESS.md). All client accounts have the
+same read-only catalogue access; these are not per-user datasets or quotas.
 
 ### Unattended clients
 

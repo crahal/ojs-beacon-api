@@ -26,6 +26,15 @@ from typing import BinaryIO, Callable
 
 from download_beacon import read_validated_metadata, validate_cached_snapshot
 from compact_storage import COMPACT_STORAGE_PROFILE, CompactStorageError, render_compact_sql
+from storage_layout import (
+    CleanExportDDL, StorageLayoutError, audit_storage_layout, compression_options, compression_page_kb,
+    event_history_enabled, event_history_profile as event_layout_profile, layout_profile,
+    recorded_layout_audit_options, render_event_history_sql,
+)
+from deferred_payload import (
+    BaselinePayloadTransform, DEFERRED_PAYLOAD_PROFILE, DeferredPayloadError,
+    TRACKING_SQL, TRACKING_TABLE, deferred_payload_enabled, hydration_prefix,
+)
 from metadata_storage import (
     METADATA_STORAGE_PROFILE, MetadataStorageError,
     render_metadata_storage_sql, migrate_metadata_storage,
@@ -36,6 +45,13 @@ from bootstrap_recovery import validate_bootstrap_touched_keys, render_bootstrap
 from source_activity import (
     SourceActivityBusy, SourceActivityError, source_activity,
     source_activity_child_options,
+)
+from export_handoff import (
+    ExportHandoffError, retirement_enabled, preflight_retirement,
+    prepare_export_ready, validate_export_ready, validate_resume_handoff,
+    retire_baseline_export, require_export_capacity, read_checkpoint_document,
+    export_capacity_requirements, sync_handoff_artifacts, reusable_successor_export,
+    regular_file_sha256,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -431,13 +447,12 @@ def retained_snapshot_matches_release(snapshot: Snapshot, clean_dir: Path) -> bo
     """Recognize completed history after its bulky clean export was pruned.
 
     Require the retained commit marker and checksummed report to bind the input
-    to its original SQL hash. Only a current, stat-bound gzip validation cache
-    can supply that hash without rescanning a potentially enormous raw file.
+    to its original SQL hash. Gzip uses its stat-bound validation cache; plain
+    SQL requires a stable streaming hash because it has no validation cache.
     """
-    if not snapshot.path.name.endswith(".gz"):
-        return False
-    metadata = read_validated_metadata(snapshot.path)
-    if metadata is None:
+    compressed = snapshot.path.name.endswith(".gz")
+    metadata = read_validated_metadata(snapshot.path) if compressed else None
+    if compressed and metadata is None:
         return False
     report_path = change_report_path(clean_dir, snapshot.version)
     try:
@@ -474,20 +489,24 @@ def retained_snapshot_matches_release(snapshot: Snapshot, clean_dir: Path) -> bo
             "date": snapshot.version,
             "completed_at": snapshot.completed_at.isoformat(),
             "source_size_bytes": snapshot.size,
-            "source_sha256": metadata["uncompressed_sha256"],
         }
         # Compression may change the filename without changing the logical SQL.
         source_names = {
             f"pkpbeacon-{snapshot.version}.sql",
             f"pkpbeacon-{snapshot.version}.sql.gz",
         }
-        return (
-            metadata["dump_date"] == snapshot.version
-            and metadata["dump_datetime"] == snapshot.completed_at.isoformat(sep=" ")
-            and metadata["uncompressed_size"] == snapshot.size
-            and recorded.get("source_filename") in source_names
-            and all(recorded.get(key) == value for key, value in expected_source.items())
-        )
+        if (recorded.get("source_filename") not in source_names
+                or not all(recorded.get(key) == value for key, value in expected_source.items())
+                or not isinstance(recorded.get("source_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", recorded["source_sha256"])):
+            return False
+        if compressed:
+            return (metadata["dump_date"] == snapshot.version
+                    and metadata["dump_datetime"] == snapshot.completed_at.isoformat(sep=" ")
+                    and metadata["uncompressed_size"] == snapshot.size
+                    and recorded["source_sha256"] == metadata["uncompressed_sha256"])
+        return (snapshot.path.name == f"pkpbeacon-{snapshot.version}.sql"
+                and regular_file_sha256(snapshot.path) == recorded["source_sha256"])
     except (OSError, UnicodeError, ValueError, TypeError, KeyError):
         return False
 
@@ -544,11 +563,24 @@ def sha256_small_file(path: Path, progress_seconds: float | None = None) -> str:
 
 def split_build_sql(
     path: Path, compact_storage: bool = False, *, lossless_metadata: bool = False,
+    compressed_page_kb: int | None = None,
+    deferred_baseline_payload: bool = False,
+    compress_event_history: bool | None = None,
 ) -> BuildSQLParts:
+    try:
+        page_kb = compression_page_kb() if compressed_page_kb is None else compressed_page_kb
+        storage_options = compression_options(page_kb)
+        events = event_history_enabled() if compress_event_history is None else compress_event_history
+        if type(events) is not bool:
+            raise StorageLayoutError("event history compression must be a boolean")
+        if (events or deferred_baseline_payload) and not compact_storage:
+            raise StorageLayoutError("event compression and baseline payload deferral require compact storage")
+    except StorageLayoutError as exc:
+        raise PipelineError(str(exc)) from exc
     sql = path.read_text(encoding="utf-8")
     if compact_storage:
         try:
-            sql = render_compact_sql(sql)
+            sql = render_compact_sql(sql, deferred_baseline_payload=deferred_baseline_payload)
         except CompactStorageError as exc:
             raise PipelineError(str(exc)) from exc
     if lossless_metadata:
@@ -558,8 +590,13 @@ def split_build_sql(
             raise PipelineError(str(exc)) from exc
     sql = sql.replace(
         "/* OJS_COMPACT_TABLE */",
-        "ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8" if compact_storage else "",
+        storage_options if compact_storage else "",
     )
+    if events:
+        try:
+            sql = render_event_history_sql(sql, page_kb)
+        except StorageLayoutError as exc:
+            raise PipelineError(str(exc)) from exc
     if sql.count(METADATA_BEGIN_MARKER) != 1:
         raise PipelineError(
             f"{path.name} must contain exactly one {METADATA_BEGIN_MARKER}"
@@ -617,7 +654,11 @@ class RawRecordsDDL:
     Unexpected records DDL fails closed instead of silently losing compression.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, page_kb: int = 8) -> None:
+        try:
+            self.storage_options = compression_options(page_kb).encode("ascii")
+        except StorageLayoutError as exc:
+            raise PipelineError(str(exc)) from exc
         self.line_start = True
         self.in_records = False
         self.complete = False
@@ -644,7 +685,7 @@ class RawRecordsDDL:
             self.complete = True
             return chunk.replace(
                 b") ENGINE=InnoDB",
-                b") ENGINE=InnoDB ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8",
+                b") ENGINE=InnoDB " + self.storage_options,
                 1,
             )
         return chunk
@@ -706,6 +747,11 @@ class MySQLServer:
         self.datadir = datadir.resolve()
         self.buffer_pool_size = buffer_pool_size
         self.compact_storage = compact_storage
+        try:
+            self.compressed_page_kb = compression_page_kb()
+            self.compress_event_history = event_history_enabled()
+        except StorageLayoutError as exc:
+            raise PipelineError(str(exc)) from exc
         self.scratch_root = mysql_scratch_root(self.datadir)
         self._scratch_dir: Path | None = None
         self._scratch_identity: tuple[int, int] | None = None
@@ -1093,24 +1139,46 @@ class MySQLServer:
         progress_seconds: float,
         calculate_sha256: bool,
         compact_records: bool = False,
+        compact_clean_export: bool = False,
+        defer_baseline_payload: bool = False,
+        compress_event_history: bool = False,
+        restore_uncompressed_events: bool = False,
     ) -> str | None:
         digest = hashlib.sha256() if calculate_sha256 else None
         processed = 0
-        ddl = RawRecordsDDL() if compact_records else None
+        if compact_records and compact_clean_export:
+            raise PipelineError("cannot transform raw and clean table declarations together")
+        ddl = (RawRecordsDDL(self.compressed_page_kb) if compact_records
+               else CleanExportDDL(self.compressed_page_kb, compress_events=compress_event_history,
+                                   restore_uncompressed_events=restore_uncompressed_events)
+               if compact_clean_export else None)
+        payload = BaselinePayloadTransform() if defer_baseline_payload else None
         def feed(target: BinaryIO, progress: Progress) -> None:
             nonlocal processed
             read_chunk = (
                 (lambda: source.readline(64 * 1024))
-                if ddl is not None else (lambda: source.read(BUFFER_SIZE))
+                if ddl is not None or payload is not None else (lambda: source.read(BUFFER_SIZE))
             )
             while chunk := read_chunk():
                 if digest is not None:
                     digest.update(chunk)
-                target.write(ddl.transform(chunk) if ddl else chunk)
+                try:
+                    transformed = ddl.transform(chunk) if ddl else chunk
+                    target.write(payload.transform(transformed) if payload else transformed)
+                except (StorageLayoutError, DeferredPayloadError) as exc:
+                    raise PipelineError(str(exc)) from exc
                 processed += len(chunk)
                 progress.update(processed_bytes=processed)
             if ddl is not None:
-                ddl.finish()
+                try:
+                    ddl.finish()
+                except StorageLayoutError as exc:
+                    raise PipelineError(str(exc)) from exc
+            if payload is not None:
+                try:
+                    target.write(payload.finish())
+                except DeferredPayloadError as exc:
+                    raise PipelineError(str(exc)) from exc
             if total > 0 and processed != total:
                 raise PipelineError(f"MySQL import consumed {processed} bytes; expected {total}")
             progress.update(step="waiting-for-mysql")
@@ -1155,8 +1223,36 @@ class MySQLServer:
         database: str,
         password: str | None,
         progress_seconds: float,
+        defer_baseline_payload: bool = False,
+        expected_sha256: str | None = None,
     ) -> None:
+        if expected_sha256 is not None and _declared_checksum(clean_export.path) != expected_sha256:
+            raise PipelineError("baseline export checksum declaration changed before import")
         verify_checksum_sidecar(clean_export.path, progress_seconds=progress_seconds)
+        compress_events = getattr(self, "compress_event_history", False)
+        rewrite_layout = self.compact_storage and (self.compressed_page_kb != 8 or compress_events)
+        restore_events = False
+        # Returning to the default layout from a new dense release must also
+        # rewrite its DDL. Legacy/default exports retain their original byte
+        # stream and need no new parser or report requirement.
+        prior_report = change_report_path(clean_export.path.parent, clean_export.version)
+        if self.compact_storage and prior_report.is_file():
+            try:
+                prior_storage = json.loads(prior_report.read_text(encoding="utf-8")).get("storage", {})
+                prior_layout = prior_storage.get("storage_layout_profile")
+                prior_events = prior_storage.get("event_history_profile")
+            except (OSError, ValueError, AttributeError) as exc:
+                raise PipelineError("prior clean export storage layout could not be verified") from exc
+            if prior_layout is not None:
+                if prior_layout != layout_profile(4):
+                    raise PipelineError("prior clean export has an unsupported physical storage layout")
+                rewrite_layout = True
+            if prior_events is not None:
+                if prior_events not in (event_layout_profile(8), event_layout_profile(4)):
+                    raise PipelineError("prior clean export has an unsupported event history layout")
+                if not compress_events:
+                    restore_events = True
+                    rewrite_layout = True
         with gzip.open(clean_export.path, "rb") as source:
             self._stream_into_mysql(
                 source,
@@ -1166,7 +1262,46 @@ class MySQLServer:
                 password=password,
                 progress_seconds=progress_seconds,
                 calculate_sha256=False,
+                compact_clean_export=rewrite_layout,
+                defer_baseline_payload=defer_baseline_payload,
+                compress_event_history=compress_events,
+                restore_uncompressed_events=restore_events,
             )
+
+    def hydrate_baseline_payload(
+        self, clean_export: CleanExport, *, database: str, password: str | None,
+        progress_seconds: float, expected_sha256: str,
+    ) -> int:
+        """Restore retained payload using one connection and bounded SQL batches."""
+        if _declared_checksum(clean_export.path) != expected_sha256:
+            raise PipelineError("baseline export checksum declaration changed before payload hydration")
+        verify_checksum_sidecar(clean_export.path, progress_seconds=progress_seconds)
+        parser = BaselinePayloadTransform(hydrate=True)
+
+        def feed(target: BinaryIO, progress: Progress) -> None:
+            target.write(("\n".join(SQL_SESSION_PRELUDE) + "\nSET autocommit=1;\n"
+                          "SET NAMES utf8mb4;\n").encode("ascii"))
+            target.write(hydration_prefix())
+            processed = 0
+            with gzip.open(clean_export.path, "rb") as source:
+                while chunk := source.readline(64 * 1024):
+                    try:
+                        target.write(parser.transform(chunk))
+                    except DeferredPayloadError as exc:
+                        raise PipelineError(str(exc)) from exc
+                    processed += len(chunk)
+                    progress.update(processed_bytes=processed, baseline_rows=parser.rows)
+            try:
+                target.write(parser.finish())
+            except DeferredPayloadError as exc:
+                raise PipelineError(str(exc)) from exc
+            progress.update(step="waiting-for-mysql")
+
+        self._run_mysql(
+            feed, label="baseline-payload-hydration", database=database, password=password,
+            interval=progress_seconds, processed_bytes=0, step="feeding-mysql", stream_progress=False,
+        )
+        return parser.rows
 
     def export_clean_tables(
         self,
@@ -2009,6 +2144,13 @@ def verify_existing_database(
     verify_source_checksum: bool,
 ) -> BuildCounts:
     assert_database_stopped(datadir)
+    report_path = change_report_path(datadir.parent, snapshot.version)
+    verify_checksum_sidecar(report_path, progress_seconds=progress_seconds)
+    try:
+        recorded_storage = json.loads(report_path.read_text(encoding="utf-8")).get("storage", {})
+        audit_options = recorded_layout_audit_options(recorded_storage)
+    except (OSError, ValueError, AttributeError) as exc:
+        raise PipelineError(f"invalid release storage metadata: {report_path}: {exc}") from exc
     expected_source_sha256 = None
     if verify_source_checksum:
         print(f"[verify] hashing {snapshot.path.name}")
@@ -2023,6 +2165,12 @@ def verify_existing_database(
         counts, _ = validate_database(
             server, database, root_password, require_raw=False
         )
+        if audit_options is not None:
+            try:
+                audit_storage_layout(server, database=database, password=root_password,
+                                     **audit_options)
+            except StorageLayoutError as exc:
+                raise PipelineError(str(exc)) from exc
         metadata = server.execute(
             """
             SELECT
@@ -2319,6 +2467,10 @@ def write_build_state(
     build_sql_sha256: str,
     phase: str,
     metadata_storage_profile: str | None = None,
+    storage_layout_profile: str | None = None,
+    baseline_payload_profile: str | None = None,
+    baseline_export_sha256: str | None = None,
+    event_history_profile: str | None = None,
 ) -> None:
     path = build_state_path(staging_dir)
     temporary = path.with_suffix(".tmp")
@@ -2333,6 +2485,13 @@ def write_build_state(
             "phase": phase,
             **({"metadata_storage_profile": metadata_storage_profile}
                if metadata_storage_profile is not None else {}),
+            **({"storage_layout_profile": storage_layout_profile}
+               if storage_layout_profile is not None else {}),
+            **({"baseline_payload_profile": baseline_payload_profile,
+                "baseline_export_sha256": baseline_export_sha256}
+               if baseline_payload_profile is not None else {}),
+            **({"event_history_profile": event_history_profile}
+               if event_history_profile is not None else {}),
         },
         sort_keys=True,
     ) + "\n"
@@ -2350,15 +2509,34 @@ def write_build_state(
 
 def read_build_state(staging_dir: Path) -> dict[str, object] | None:
     path = build_state_path(staging_dir)
-    if not path.is_file():
+    if not path.exists() and not path.is_symlink():
         return None
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        state = read_checkpoint_document(path)
+    except (OSError, ValueError) as exc:
         raise PipelineError(f"invalid build checkpoint: {path}") from exc
     if not isinstance(state, dict):
         raise PipelineError(f"invalid build checkpoint: {path}")
     return state
+
+
+def validate_staging_layout(
+    staging_dir: Path, storage_layout_profile: str | None, *,
+    baseline_payload_profile: str | None = None, baseline_export_sha256: str | None = None,
+    event_history_profile: str | None = None,
+) -> None:
+    """Reject a changed layout before force/recovery can invalidate artifacts."""
+    if not staging_dir.exists():
+        return
+    state = read_build_state(staging_dir)
+    if (state or {}).get("storage_layout_profile") != storage_layout_profile:
+        raise PipelineError("existing staging database has a different physical storage layout; existing files retained")
+    if (state or {}).get("event_history_profile") != event_history_profile:
+        raise PipelineError("existing staging database has a different event history layout; existing files retained")
+    expected_baseline = {"baseline_payload_profile": baseline_payload_profile,
+                         "baseline_export_sha256": baseline_export_sha256}
+    if any((state or {}).get(key) != value for key, value in expected_baseline.items()):
+        raise PipelineError("existing staging database has a different baseline payload profile or export checksum; existing files retained")
 
 
 def validate_resume_state(
@@ -2369,6 +2547,10 @@ def validate_resume_state(
     database: str,
     password: str | None,
     build_sql_sha256: str,
+    storage_layout_profile: str | None = None,
+    baseline_payload_profile: str | None = None,
+    baseline_export_sha256: str | None = None,
+    event_history_profile: str | None = None,
 ) -> str | None:
     if server.execute(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
@@ -2378,6 +2560,14 @@ def validate_resume_state(
         raise PipelineError("imported raw storage has entered finalization; metadata resume is unsafe")
     state = read_build_state(staging_dir)
     if state is not None:
+        if state.get("storage_layout_profile") != storage_layout_profile:
+            raise PipelineError("staging checkpoint has a different physical storage layout")
+        if state.get("event_history_profile") != event_history_profile:
+            raise PipelineError("staging checkpoint has a different event history layout")
+        expected_baseline = {"baseline_payload_profile": baseline_payload_profile,
+                             "baseline_export_sha256": baseline_export_sha256}
+        if any(state.get(key) != value for key, value in expected_baseline.items()):
+            raise PipelineError("staging checkpoint has a different baseline payload profile or export checksum")
         if ("metadata_storage_profile" in state
                 and state["metadata_storage_profile"] != METADATA_STORAGE_PROFILE):
             raise PipelineError("staging checkpoint has an unsupported metadata storage profile")
@@ -2406,6 +2596,13 @@ def validate_resume_state(
         ):
             raise PipelineError("staging checkpoint has an invalid source SHA-256")
         return source_sha256
+
+    if storage_layout_profile is not None:
+        raise PipelineError("the selected physical storage layout requires a matching staging checkpoint")
+    if baseline_payload_profile is not None:
+        raise PipelineError("deferred baseline payload requires a matching staging checkpoint")
+    if event_history_profile is not None:
+        raise PipelineError("event history compression requires a matching staging checkpoint")
 
     # Compatibility path for a pre-checkpoint build interrupted exactly during
     # the metadata insert. Both inserts are atomic, so a nonempty source index
@@ -2510,6 +2707,74 @@ def extract_metadata_in_parallel(
             raise
 
 
+def validate_export_ready_database(
+    server: MySQLServer, *, state: dict, database: str, password: str,
+) -> BuildCounts:
+    """Recheck a cold-started, fully hydrated candidate without replaying SQL."""
+    report = state["export_handoff"]["report"]
+    counts, _ = validate_database(server, database, password, require_raw=False)
+    expected_counts = (report["source_rows"]["retained_total"], report["source_rows"]["active"],
+                       report["articles"]["retained_total"], report["articles"]["active"],
+                       report["articles"]["removed_tombstones"], report["articles"]["merged_tombstones"],
+                       report["article_events"]["total"])
+    if tuple(vars(counts).values()) != expected_counts:
+        raise PipelineError("export-ready database counts no longer match the durable report")
+    names = server.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE';",
+        database=database, password=password, label="export-ready-table-check",
+    ).splitlines()
+    if set(names) != set(CLEAN_EXPORT_TABLES) | {"ojs_pipeline_metadata"}:
+        raise PipelineError("export-ready database contains unfinished build or missing clean tables")
+    provenance = server.execute(
+        "SELECT pipeline_version, DATE_FORMAT(snapshot_date, '%Y-%m-%d'), "
+        "source_filename, source_size_bytes, source_sha256, build_sql_sha256, "
+        "source_record_count, active_source_count, article_count, active_article_count, "
+        "removed_article_count, merged_article_count, event_count "
+        "FROM ojs_pipeline_metadata WHERE id = 1;",
+        database=database, password=password, label="export-ready-provenance-check",
+    ).split("\t")
+    expected = [PIPELINE_VERSION, state["snapshot_version"], state["source_filename"],
+                str(state["source_size_bytes"]), state["source_sha256"], state["build_sql_sha256"],
+                *(str(value) for value in expected_counts)]
+    if provenance != expected:
+        raise PipelineError("export-ready database provenance no longer matches its checkpoint")
+    options = recorded_layout_audit_options(report["storage"])
+    if options is not None:
+        audit_storage_layout(server, database=database, password=password, **options)
+    return counts
+
+
+def event_auto_increment(server: MySQLServer, *, database: str, password: str) -> int:
+    """Match the allocator emitted by mysqldump, including unused reservations."""
+    ddl = server.execute("SHOW CREATE TABLE ojs_article_events;", database=database,
+                         password=password, label="export-ready-event-allocator")
+    matches = re.findall(r"\bAUTO_INCREMENT=([0-9]+)\b", ddl)
+    if len(matches) != 1:
+        raise PipelineError("cannot determine the export-ready event allocator")
+    return int(matches[0])
+
+
+def restore_event_auto_increment(server: MySQLServer, *, state: dict,
+                                database: str, password: str) -> None:
+    # InnoDB can discard unused AUTO_INCREMENT reservations at a cold restart.
+    # Preserve the allocator that the ordinary warm export would have recorded
+    # so later snapshots allocate exactly the same event IDs after this handoff.
+    expected = state["export_handoff"]["event_auto_increment"]
+    current = event_auto_increment(server, database=database, password=password)
+    maximum = int(server.execute("SELECT COALESCE(MAX(event_id),0) FROM ojs_article_events;",
+                                 database=database, password=password,
+                                 label="export-ready-event-maximum"))
+    if current > expected or maximum >= expected:
+        raise PipelineError("export-ready event allocator no longer matches the checkpoint")
+    if current != expected:
+        server.execute(f"ALTER TABLE ojs_article_events AUTO_INCREMENT={expected};",
+                       database=database, password=password,
+                       label="export-ready-restore-event-allocator")
+        if event_auto_increment(server, database=database, password=password) != expected:
+            raise PipelineError("export-ready event allocator could not be restored")
+
+
 def build_snapshot_database(
     *,
     snapshot: Snapshot,
@@ -2534,9 +2799,34 @@ def build_snapshot_database(
     recover_exact_keys: bool = False,
     recover_touched_keys: bool = False,
 ) -> tuple[Path, BuildCounts | None]:
-    tools = MySQLTools.discover()
     final_dir = clean_dir / f"mysql-{snapshot.version}"
+    verifying_completed = (verify_existing and final_dir.is_dir() and not force_rebuild
+                           and not recover_exact_keys and not recover_touched_keys)
+    try:
+        compressed_page_kb = compression_page_kb()
+        defer_baseline_payload = deferred_payload_enabled()
+        compress_event_history = event_history_enabled()
+        retire_baseline = retirement_enabled()
+    except (StorageLayoutError, DeferredPayloadError, ExportHandoffError) as exc:
+        raise PipelineError(str(exc)) from exc
+    if compressed_page_kb != 8 and not compact_storage and not verifying_completed:
+        raise PipelineError("non-default compressed page sizes require --compact-storage")
+    if defer_baseline_payload and not compact_storage and not verifying_completed:
+        raise PipelineError("deferred baseline payload requires --compact-storage")
+    if compress_event_history and not compact_storage and not verifying_completed:
+        raise PipelineError("event history compression requires --compact-storage")
+    if retire_baseline and not verifying_completed and (not compact_storage or not defer_baseline_payload):
+        raise PipelineError("baseline export retirement requires compact storage and deferred baseline payload")
+    storage_layout_profile = layout_profile(compressed_page_kb) if compressed_page_kb != 8 else None
+    baseline_payload_profile = DEFERRED_PAYLOAD_PROFILE if defer_baseline_payload else None
+    event_profile = event_layout_profile(compressed_page_kb) if compress_event_history else None
+    tools = MySQLTools.discover()
     staging_dir = clean_dir / f"mysql-{snapshot.version}.building"
+    if recover_exact_keys or recover_touched_keys:
+        if staging_dir.is_symlink() or not staging_dir.is_dir():
+            raise PipelineError("exact-key recovery requires an existing, non-symlinked staging database")
+        if build_state_path(staging_dir).is_symlink():
+            raise PipelineError("refusing a symlinked recovery checkpoint")
     final_export = clean_export_path(clean_dir, snapshot.version)
     final_report = change_report_path(clean_dir, snapshot.version)
     final_manifest = release_manifest_path(clean_dir, snapshot.version)
@@ -2544,6 +2834,108 @@ def build_snapshot_database(
     temporary_report = clean_dir / f".{final_report.name}.tmp"
     temporary_manifest = clean_dir / f".{final_manifest.name}.tmp"
     build_sql_sha256 = sha256_small_file(build_sql)
+    prior_export = previous_clean_export(clean_dir, snapshot.version)
+    baseline_export_sha256 = None
+    ready_state = None
+    retirement_plan = None
+    if final_dir.is_dir() and (final_dir / BUILD_STATE_NAME).exists():
+        try:
+            final_ready = validate_export_ready(final_dir)
+        except (ExportHandoffError, OSError, ValueError) as exc:
+            raise PipelineError("invalid final export checkpoint; existing files retained") from exc
+        if final_ready is not None and not release_artifacts_complete(clean_dir, snapshot.version):
+            if staging_dir.exists():
+                raise PipelineError("both final and staging export checkpoints exist; existing files retained")
+            staging_dir = final_dir
+            verifying_completed = False
+    # Inspect this boundary before looking for the predecessor archive: it may
+    # have been intentionally retired after this durable checkpoint was saved.
+    if staging_dir.exists():
+        try:
+            ready_state = validate_export_ready(staging_dir)
+        except (ExportHandoffError, OSError, ValueError) as exc:
+            raise PipelineError("invalid export-ready checkpoint; existing files retained") from exc
+    if ready_state is not None:
+        if not retire_baseline or not resume_building or force_rebuild or recover_exact_keys or recover_touched_keys:
+            raise PipelineError("export-ready candidate requires retirement opt-in and --resume-building without force/recovery; existing files retained")
+        expected = {"pipeline_version": PIPELINE_VERSION, "snapshot_version": snapshot.version,
+                    "source_filename": snapshot.path.name, "source_size_bytes": snapshot.size,
+                    "build_sql_sha256": build_sql_sha256,
+                    "metadata_storage_profile": METADATA_STORAGE_PROFILE,
+                    "storage_layout_profile": storage_layout_profile,
+                    "baseline_payload_profile": baseline_payload_profile,
+                    "event_history_profile": event_profile}
+        if any(ready_state.get(key) != value for key, value in expected.items()):
+            raise PipelineError("export-ready source, build or storage profile changed; existing files retained")
+        try:
+            baseline_version = ready_state["export_handoff"]["baseline"]["snapshot_date"]
+            validate_resume_handoff(clean_dir, snapshot.version, baseline_version)
+        except (ExportHandoffError, OSError, ValueError) as exc:
+            raise PipelineError("export-ready predecessor could not be verified; existing files retained") from exc
+        baseline_export_sha256 = ready_state["baseline_export_sha256"]
+    if verifying_completed:
+        # Verification describes the completed release, not a proposed new
+        # build. It must still work in a fresh checkout with default flags and
+        # after the predecessor export has been removed by normal retention.
+        verify_checksum_sidecar(final_report, progress_seconds=progress_seconds)
+        try:
+            recorded_storage = json.loads(final_report.read_text(encoding="utf-8")).get("storage", {})
+            recorded_layout_audit_options(recorded_storage)
+            storage_layout_profile = recorded_storage.get("storage_layout_profile")
+            event_profile = recorded_storage.get("event_history_profile")
+            completed_baseline = recorded_storage.get("deferred_baseline_payload", {})
+            baseline_payload_profile = completed_baseline.get("profile")
+            baseline_export_sha256 = completed_baseline.get("baseline_export_sha256")
+            if (baseline_payload_profile is not None or baseline_export_sha256 is not None):
+                if (baseline_payload_profile != DEFERRED_PAYLOAD_PROFILE
+                        or not isinstance(baseline_export_sha256, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", baseline_export_sha256)):
+                    raise ValueError("unsupported baseline payload binding")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise PipelineError("existing release storage bindings could not be verified") from exc
+    elif defer_baseline_payload and ready_state is None:
+        if final_dir.exists() and not force_rebuild:
+            # A completed release owns fully hydrated payload. Its predecessor
+            # may have been removed by successful retention; verification needs
+            # the authenticated recorded binding, not that old input archive.
+            verify_checksum_sidecar(final_report, progress_seconds=progress_seconds)
+            try:
+                completed_baseline = json.loads(final_report.read_text(encoding="utf-8")).get(
+                    "storage", {},
+                ).get("deferred_baseline_payload", {})
+                baseline_export_sha256 = completed_baseline.get("baseline_export_sha256")
+                if (completed_baseline.get("profile") != baseline_payload_profile
+                        or not isinstance(baseline_export_sha256, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", baseline_export_sha256)):
+                    raise ValueError
+            except (OSError, ValueError, AttributeError) as exc:
+                raise PipelineError("existing release baseline payload binding could not be verified") from exc
+        else:
+            if prior_export is None:
+                raise PipelineError("deferred baseline payload requires a complete prior clean export")
+            baseline_export_sha256 = _declared_checksum(prior_export.path)
+            if baseline_export_sha256 is None:
+                raise PipelineError("deferred baseline payload requires a valid prior export checksum")
+    if (retire_baseline and not verifying_completed and ready_state is None
+            and (not final_dir.exists() or force_rebuild)):
+        if prior_export is None:
+            raise PipelineError("baseline export retirement requires a complete prior clean export")
+        try:
+            export_capacity_requirements()
+            retirement_plan = preflight_retirement(
+                clean_dir, prior_export.version, expected_export_sha256=baseline_export_sha256,
+            )
+        except (ExportHandoffError, OSError, ValueError) as exc:
+            raise PipelineError("baseline export retirement preflight failed; existing files retained") from exc
+    if not verifying_completed:
+        validate_staging_layout(
+            staging_dir, storage_layout_profile, baseline_payload_profile=baseline_payload_profile,
+            baseline_export_sha256=baseline_export_sha256,
+            event_history_profile=event_profile,
+        )
+    if (not verifying_completed and defer_baseline_payload and staging_dir.exists() and resume_building and not force_rebuild
+            and ready_state is None and (read_build_state(staging_dir) or {}).get("phase") != "metadata_ready"):
+        raise PipelineError("deferred baseline payload can resume only at metadata_ready or export_ready; existing files retained")
 
     recovering_bootstrap = recover_exact_keys or recover_touched_keys
     try:
@@ -2561,6 +2953,12 @@ def build_snapshot_database(
         # Refuse before any output invalidation, deletion or MySQL startup.
         if not compact_storage or not resume_building or force_rebuild:
             raise PipelineError("exact-key recovery requires compact storage, --resume-building, and no --force-rebuild")
+        if storage_layout_profile is not None:
+            raise PipelineError("legacy bootstrap recovery requires the original 8 KiB storage layout")
+        if baseline_payload_profile is not None:
+            raise PipelineError("legacy bootstrap recovery cannot defer baseline payload")
+        if event_profile is not None:
+            raise PipelineError("legacy bootstrap recovery cannot change event history layout")
         if staging_dir.is_symlink() or not staging_dir.is_dir():
             raise PipelineError("exact-key recovery requires an existing, non-symlinked staging database")
         forbidden = [p for p in clean_dir.iterdir() if (
@@ -2578,6 +2976,8 @@ def build_snapshot_database(
         checkpoint = read_build_state(staging_dir)
         if checkpoint is not None and "metadata_storage_profile" in checkpoint:
             raise PipelineError("legacy bootstrap recovery cannot resume a profiled metadata-storage build")
+        if checkpoint is not None and "storage_layout_profile" in checkpoint:
+            raise PipelineError("legacy bootstrap recovery cannot resume a different physical storage layout")
         expected_checkpoint = {
             "pipeline_version": PIPELINE_VERSION,
             "snapshot_version": snapshot.version,
@@ -2595,8 +2995,21 @@ def build_snapshot_database(
     for owned_dir in (final_dir, staging_dir):
         if owned_dir.exists():
             assert_database_stopped(owned_dir)
-    if final_dir.exists():
+    if final_dir.exists() and ready_state is None:
         if not force_rebuild:
+            try:
+                recorded_storage = json.loads(final_report.read_text(encoding="utf-8")).get("storage", {})
+                recorded_layout = recorded_storage.get("storage_layout_profile")
+                recorded_baseline = recorded_storage.get("deferred_baseline_payload", {})
+            except (OSError, ValueError, AttributeError) as exc:
+                raise PipelineError("existing release storage layout could not be verified") from exc
+            if recorded_layout != storage_layout_profile:
+                raise PipelineError("existing release has a different physical storage layout")
+            if recorded_storage.get("event_history_profile") != event_profile:
+                raise PipelineError("existing release has a different event history layout")
+            if (recorded_baseline.get("profile") != baseline_payload_profile
+                    or recorded_baseline.get("baseline_export_sha256") != baseline_export_sha256):
+                raise PipelineError("existing release has a different baseline payload profile or export checksum")
             print(f"[publish] database already built: {final_dir}")
             counts = verify_existing_database(
                 snapshot=snapshot,
@@ -2687,7 +3100,6 @@ def build_snapshot_database(
     temporary_report.unlink(missing_ok=True)
     temporary_manifest.unlink(missing_ok=True)
 
-    prior_export = previous_clean_export(clean_dir, snapshot.version)
     print(f"[initialize] {staging_dir}")
     if prior_export:
         print(
@@ -2704,20 +3116,34 @@ def build_snapshot_database(
     success = False
     counts: BuildCounts | None = None
     recovery_audit: dict | None = None
+    reuse_export = False
     try:
         # Base SQL identity and normalization remain unchanged. The separately
         # recorded storage profile only widens XML-derived text declarations.
         # Keep the exact-hash legacy bootstrap recovery path unmodified.
         build_parts = split_build_sql(
             build_sql, compact_storage, lossless_metadata=not recovering_bootstrap,
+            compressed_page_kb=compressed_page_kb,
+            deferred_baseline_payload=defer_baseline_payload,
+            compress_event_history=compress_event_history,
         )
         original_rendered_build_hash = hashlib.sha256(
             (build_parts.prefix + build_parts.metadata + build_parts.suffix).encode("utf-8")
         ).hexdigest()
+        if (ready_state is not None and ready_state["export_handoff"]["report"]["storage"].get(
+                "rendered_build_sql_sha256") != original_rendered_build_hash):
+            raise PipelineError("export-ready rendered build SQL changed; candidate retained")
         recovery_suffix = render_bootstrap_touched_recovery(build_parts.suffix) if recover_touched_keys else None
         if compact_storage:
             print(f"[storage] profile={COMPACT_STORAGE_PROFILE}; "
                   "full source payloads are deferred until canonical selection", flush=True)
+            if storage_layout_profile is not None:
+                print(f"[storage] physical_layout={storage_layout_profile}", flush=True)
+            if baseline_payload_profile is not None:
+                print(f"[storage] baseline_payload={baseline_payload_profile}; "
+                      "retained payload hydration follows raw and stage reclamation", flush=True)
+            if event_profile is not None:
+                print(f"[storage] event_history={event_profile}", flush=True)
         prelude_factory: Callable[[], str] = lambda: build_sql_prelude(
             snapshot=snapshot,
             source_sha256=source_sha256,
@@ -2726,7 +3152,14 @@ def build_snapshot_database(
             full_rescan=full_rescan,
         )
 
-        if recovering_bootstrap:
+        if ready_state is not None:
+            print("[resume] export-ready candidate; verifying retained source and cold database", flush=True)
+            source_sha256 = snapshot_sha256(snapshot, progress_seconds)
+            if source_sha256 != ready_state["source_sha256"]:
+                raise PipelineError("raw SQL checksum does not match the export-ready checkpoint")
+            report = ready_state["export_handoff"]["report"]
+            active_password = root_password
+        elif recovering_bootstrap:
             print(f"[recover] starting existing bootstrap database {staging_dir}; no import or metadata replay", flush=True)
             server.start(active_password)
             wait_innodb_rollback(server, database=database, password=active_password,
@@ -2758,6 +3191,10 @@ def build_snapshot_database(
                 database=database,
                 password=active_password,
                 build_sql_sha256=build_sql_sha256,
+                storage_layout_profile=storage_layout_profile,
+                baseline_payload_profile=baseline_payload_profile,
+                baseline_export_sha256=baseline_export_sha256,
+                event_history_profile=event_profile,
             )
             print(f"[checksum] verifying raw {snapshot.path.name} for resume")
             source_sha256 = snapshot_sha256(snapshot, progress_seconds)
@@ -2772,6 +3209,10 @@ def build_snapshot_database(
                 build_sql_sha256=build_sql_sha256,
                 phase="metadata_ready",
                 metadata_storage_profile=METADATA_STORAGE_PROFILE,
+                storage_layout_profile=storage_layout_profile,
+                baseline_payload_profile=baseline_payload_profile,
+                baseline_export_sha256=baseline_export_sha256,
+                event_history_profile=event_profile,
             )
             server.execute(
                 "TRUNCATE TABLE ojs_stage_sources;",
@@ -2783,6 +3224,18 @@ def build_snapshot_database(
             (staging_dir / "PIPELINE_FAILED.txt").unlink(missing_ok=True)
         else:
             server.initialize()
+            if any(profile is not None for profile in (storage_layout_profile, baseline_payload_profile, event_profile)):
+                # Bind the physical layout before either long import starts.
+                # Interrupted imports are not resumable, but a same-profile
+                # force rebuild can still identify its generated staging tree.
+                write_build_state(
+                    staging_dir, snapshot=snapshot, source_sha256="",
+                    build_sql_sha256=build_sql_sha256, phase="importing",
+                    storage_layout_profile=storage_layout_profile,
+                    baseline_payload_profile=baseline_payload_profile,
+                    baseline_export_sha256=baseline_export_sha256,
+                    event_history_profile=event_profile,
+                )
             server.start(active_password)
             create_database(server, database)
 
@@ -2800,7 +3253,12 @@ def build_snapshot_database(
                     database=database,
                     password=active_password,
                     progress_seconds=progress_seconds,
+                    defer_baseline_payload=defer_baseline_payload,
+                    expected_sha256=baseline_export_sha256,
                 )
+                if defer_baseline_payload:
+                    server.execute(TRACKING_SQL, database=database, password=active_password,
+                                   label="baseline-payload-tracking")
 
             print(
                 f"[transform] applying {build_sql.name} "
@@ -2820,116 +3278,222 @@ def build_snapshot_database(
                 build_sql_sha256=build_sql_sha256,
                 phase="metadata_ready",
                 metadata_storage_profile=METADATA_STORAGE_PROFILE,
+                storage_layout_profile=storage_layout_profile,
+                baseline_payload_profile=baseline_payload_profile,
+                baseline_export_sha256=baseline_export_sha256,
+                event_history_profile=event_profile,
             )
 
-        if not recovering_bootstrap:
-            try:
-                metadata_storage_audit = migrate_metadata_storage(
-                    server, database=database, password=active_password,
-                    reserve_bytes=migration_reserve, progress_seconds=progress_seconds,
+        if ready_state is None:
+            if not recovering_bootstrap:
+                try:
+                    metadata_storage_audit = migrate_metadata_storage(
+                        server, database=database, password=active_password,
+                        reserve_bytes=migration_reserve, progress_seconds=progress_seconds,
+                    )
+                except MetadataStorageError as exc:
+                    raise PipelineError(str(exc)) from exc
+                extract_metadata_in_parallel(
+                    server,
+                    metadata_sql=build_parts.metadata,
+                    database=database,
+                    password=active_password,
+                    workers=metadata_workers,
+                    progress_seconds=progress_seconds,
                 )
-            except MetadataStorageError as exc:
-                raise PipelineError(str(exc)) from exc
-            extract_metadata_in_parallel(
-                server,
-                metadata_sql=build_parts.metadata,
+            baseline_article_count = None
+            if defer_baseline_payload:
+                baseline_article_count = int(server.execute(
+                    f"SELECT COUNT(*) FROM {TRACKING_TABLE};", database=database,
+                    password=active_password, label="baseline-payload-count",
+                ))
+            write_build_state(
+                staging_dir,
+                snapshot=snapshot,
+                source_sha256=source_sha256,
+                build_sql_sha256=build_sql_sha256,
+                phase="finalizing",
+                metadata_storage_profile=None if recovering_bootstrap else METADATA_STORAGE_PROFILE,
+                storage_layout_profile=storage_layout_profile,
+                baseline_payload_profile=baseline_payload_profile,
+                baseline_export_sha256=baseline_export_sha256,
+                event_history_profile=event_profile,
+            )
+            server.run_sql_text(
+                build_parts.suffix,
+                label="temporal finalization phase",
                 database=database,
                 password=active_password,
-                workers=metadata_workers,
+                prelude=prelude_factory(),
+            )
+            baseline_payload_audit = None
+            if defer_baseline_payload:
+                pending_payloads = int(server.execute(
+                    f"SELECT COUNT(*) FROM {TRACKING_TABLE};", database=database,
+                    password=active_password, label="baseline-payload-pending",
+                ))
+                baseline_rows = server.hydrate_baseline_payload(
+                    prior_export, database=database, password=active_password,
+                    progress_seconds=progress_seconds, expected_sha256=baseline_export_sha256,
+                )
+                remaining_payloads = server.execute(
+                    f"SELECT COUNT(*) FROM {TRACKING_TABLE};", database=database,
+                    password=active_password, label="baseline-payload-complete",
+                )
+                if remaining_payloads != "0" or baseline_rows != baseline_article_count:
+                    raise PipelineError("baseline payload hydration is incomplete; candidate retained without publication")
+                baseline_payload_audit = {
+                    "profile": baseline_payload_profile,
+                    "baseline_export_sha256": baseline_export_sha256,
+                    "baseline_export_filename": prior_export.path.name,
+                    "baseline_articles": baseline_article_count,
+                    "hydrated_articles": pending_payloads,
+                }
+            physical_layout_audit = None
+            if storage_layout_profile is not None or event_profile is not None:
+                try:
+                    physical_layout_audit = audit_storage_layout(
+                        server, database=database, password=active_password,
+                        page_kb=compressed_page_kb,
+                        include_event_history=compress_event_history,
+                    )
+                except StorageLayoutError as exc:
+                    raise PipelineError(str(exc)) from exc
+
+            print("[validate] checking temporal SQL tables")
+            counts, mysql_version = validate_database(
+                server,
+                database,
+                active_password,
+            )
+            write_provenance(
+                server,
+                database=database,
+                password=active_password,
+                snapshot=snapshot,
+                source_sha256=source_sha256,
+                build_sql_sha256=build_sql_sha256,
+                mysql_version=mysql_version,
+                counts=counts,
+            )
+            report = collect_change_report(
+                server,
+                database=database,
+                password=active_password,
+                snapshot=snapshot,
+                source_sha256=source_sha256,
+                build_sql_sha256=build_sql_sha256,
+                counts=counts,
+                compact_storage=compact_storage,
+            )
+            report["storage"] = {
+                "profile": COMPACT_STORAGE_PROFILE if compact_storage else "standard",
+                "rendered_build_sql_sha256": original_rendered_build_hash,
+                "raw_table_rows_reclaimed": (
+                    report["source_rows"]["raw_in_snapshot"] if compact_storage else 0
+                ),
+            }
+            if storage_layout_profile is not None:
+                report["storage"].update({
+                    "storage_layout_profile": storage_layout_profile,
+                    "compressed_page_kb": compressed_page_kb,
+                })
+            if physical_layout_audit is not None:
+                report["storage"]["physical_layout_audit"] = physical_layout_audit
+            if event_profile is not None:
+                report["storage"]["event_history_profile"] = event_profile
+            if baseline_payload_audit is not None:
+                report["storage"]["deferred_baseline_payload"] = baseline_payload_audit
+            if not recovering_bootstrap:
+                report["storage"]["metadata_storage"] = metadata_storage_audit
+            if recovery_audit is not None:
+                report["storage"]["recovery"] = recovery_audit
+            anomalies = release_anomalies(report, release_thresholds)
+            guard_status = (
+                "overridden"
+                if anomalies and allow_anomalous_release
+                else "blocked"
+                if anomalies
+                else "passed"
+            )
+            report["release_guard"] = {
+                "status": guard_status,
+                "thresholds": release_thresholds.as_dict(),
+                "anomalies": anomalies,
+            }
+            if anomalies and not allow_anomalous_release:
+                quarantine_report = clean_dir / (
+                    f"pkpbeacon-changes-{snapshot.version}.quarantined.json"
+                )
+                publish_change_report(quarantine_report, report)
+                metrics = ", ".join(str(item["metric"]) for item in anomalies)
+                raise PipelineError(
+                    "release blocked by row-loss/merge safety thresholds "
+                    f"({metrics}); inspect {quarantine_report.name} and rerun "
+                    "manually with --allow-anomalous-release only after approval"
+                )
+            stage_change_report(final_report, report)
+
+            prune_build_tables(server, database=database, password=active_password)
+            cleaned_counts, _ = validate_database(
+                server, database, active_password, require_raw=False
+            )
+            if cleaned_counts != counts:
+                raise PipelineError("clean table counts changed during raw cleanup")
+
+        if retire_baseline:
+            export_capacity_requirements()
+            if ready_state is None:
+                # Credentials belong to the completed checkpoint. Saving it
+                # only after shutdown avoids an ambiguous password on restart.
+                configure_api_database_user(
+                    server, database=database, password=active_password,
+                    api_user=api_db_user, api_password=api_db_password,
+                )
+                set_root_password(server, active_password, root_password)
+                active_password = root_password
+                next_event_id = event_auto_increment(
+                    server, database=database, password=active_password,
+                )
+                server.shutdown(active_password)
+                ready_state = prepare_export_ready(
+                    staging_dir, read_build_state(staging_dir), report=report,
+                    baseline=retirement_plan, mysql_version=tools.version,
+                    event_auto_increment=next_event_id,
+                )
+            else:
+                stage_change_report(final_report, report)
+            assert_database_stopped(staging_dir)
+            # A fresh server object also gives this cold verification a new
+            # socket/runtime and scratch allocation after the prior shutdown.
+            server = MySQLServer(
+                tools, staging_dir, buffer_pool_size, compact_storage,
                 progress_seconds=progress_seconds,
             )
-        write_build_state(
-            staging_dir,
-            snapshot=snapshot,
-            source_sha256=source_sha256,
-            build_sql_sha256=build_sql_sha256,
-            phase="finalizing",
-            metadata_storage_profile=None if recovering_bootstrap else METADATA_STORAGE_PROFILE,
-        )
-        server.run_sql_text(
-            build_parts.suffix,
-            label="temporal finalization phase",
-            database=database,
-            password=active_password,
-            prelude=prelude_factory(),
-        )
-
-        print("[validate] checking temporal SQL tables")
-        counts, mysql_version = validate_database(
-            server,
-            database,
-            active_password,
-        )
-        write_provenance(
-            server,
-            database=database,
-            password=active_password,
-            snapshot=snapshot,
-            source_sha256=source_sha256,
-            build_sql_sha256=build_sql_sha256,
-            mysql_version=mysql_version,
-            counts=counts,
-        )
-        report = collect_change_report(
-            server,
-            database=database,
-            password=active_password,
-            snapshot=snapshot,
-            source_sha256=source_sha256,
-            build_sql_sha256=build_sql_sha256,
-            counts=counts,
-            compact_storage=compact_storage,
-        )
-        report["storage"] = {
-            "profile": COMPACT_STORAGE_PROFILE if compact_storage else "standard",
-            "rendered_build_sql_sha256": original_rendered_build_hash,
-            "raw_table_rows_reclaimed": (
-                report["source_rows"]["raw_in_snapshot"] if compact_storage else 0
-            ),
-        }
-        if not recovering_bootstrap:
-            report["storage"]["metadata_storage"] = metadata_storage_audit
-        if recovery_audit is not None:
-            report["storage"]["recovery"] = recovery_audit
-        anomalies = release_anomalies(report, release_thresholds)
-        guard_status = (
-            "overridden"
-            if anomalies and allow_anomalous_release
-            else "blocked"
-            if anomalies
-            else "passed"
-        )
-        report["release_guard"] = {
-            "status": guard_status,
-            "thresholds": release_thresholds.as_dict(),
-            "anomalies": anomalies,
-        }
-        if anomalies and not allow_anomalous_release:
-            quarantine_report = clean_dir / (
-                f"pkpbeacon-changes-{snapshot.version}.quarantined.json"
+            active_password = root_password
+            server.start(active_password)
+            counts = validate_export_ready_database(
+                server, state=ready_state, database=database, password=active_password,
             )
-            publish_change_report(quarantine_report, report)
-            metrics = ", ".join(str(item["metric"]) for item in anomalies)
-            raise PipelineError(
-                "release blocked by row-loss/merge safety thresholds "
-                f"({metrics}); inspect {quarantine_report.name} and rerun "
-                "manually with --allow-anomalous-release only after approval"
+            restore_event_auto_increment(
+                server, state=ready_state, database=database, password=active_password,
             )
-        stage_change_report(final_report, report)
+            try:
+                retire_baseline_export(clean_dir, ready_state)
+                reuse_export = reusable_successor_export(clean_dir, ready_state)
+                require_export_capacity(clean_dir, export_already_written=reuse_export)
+            except (ExportHandoffError, OSError, ValueError) as exc:
+                raise PipelineError(str(exc)) from exc
 
-        prune_build_tables(server, database=database, password=active_password)
-        cleaned_counts, _ = validate_database(
-            server, database, active_password, require_raw=False
-        )
-        if cleaned_counts != counts:
-            raise PipelineError("clean table counts changed during raw cleanup")
-
-        print(f"[export] writing {final_export.name}")
-        server.export_clean_tables(
-            temporary_export,
-            database=database,
-            password=active_password,
-        )
+        if reuse_export:
+            print(f"[export] retaining verified {final_export.name}")
+        else:
+            print(f"[export] writing {final_export.name}")
+            server.export_clean_tables(
+                temporary_export,
+                database=database,
+                password=active_password,
+            )
         configure_api_database_user(
             server,
             database=database,
@@ -2958,7 +3522,8 @@ def build_snapshot_database(
     if not success or counts is None:
         raise PipelineError("database build did not complete")
 
-    build_state_path(staging_dir).unlink(missing_ok=True)
+    if ready_state is None:
+        build_state_path(staging_dir).unlink(missing_ok=True)
     (staging_dir / "PIPELINE_FAILED.txt").unlink(missing_ok=True)
     os.replace(staging_dir, final_dir)
     marker = final_dir / "OJS_COMPACT_RELEASE.json"
@@ -2973,12 +3538,19 @@ def build_snapshot_database(
                 "clean_only": True,
                 "pipeline_version": PIPELINE_VERSION,
                 "data_directory_name": final_dir.name,
+                **({"storage_layout_profile": storage_layout_profile}
+                   if storage_layout_profile is not None else {}),
+                **({"baseline_payload_profile": baseline_payload_profile,
+                    "baseline_export_sha256": baseline_export_sha256}
+                   if baseline_payload_profile is not None else {}),
+                **({"event_history_profile": event_profile} if event_profile is not None else {}),
             },
             sort_keys=True,
         ) + "\n",
         encoding="utf-8",
     )
-    os.replace(temporary_export, final_export)
+    if not reuse_export:
+        os.replace(temporary_export, final_export)
     os.replace(temporary_report, final_report)
     final_report.chmod(0o444)
     export_sha256 = sha256_file(final_export, progress_seconds)
@@ -2993,6 +3565,12 @@ def build_snapshot_database(
         report_path=final_report,
         report_sha256=report_sha256,
     )
+    if ready_state is not None:
+        sync_handoff_artifacts(clean_dir, final_dir, (
+            marker, final_export, final_report, final_manifest,
+            checksum_sidecar_path(final_export), checksum_sidecar_path(final_report),
+        ))
+    build_state_path(final_dir).unlink(missing_ok=True)
     print(
         f"[publish] clean SQL {final_export.name} "
         f"({format_bytes(final_export.stat().st_size)})"

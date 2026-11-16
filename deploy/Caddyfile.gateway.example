@@ -1,0 +1,50 @@
+# Interim tester gateway; see docs/TESTER_ACCESS.md before installation.
+# Replace PUBLIC_IP and YOUR_EMAIL; preserve your deployment's verified TLS setup.
+# Requires Caddy 2.11.9 or a separately validated compatible release.
+# Private imports, admin socket and autosave contain sensitive configuration.
+{
+	email YOUR_EMAIL
+	default_sni PUBLIC_IP
+	admin unix//run/ojs-caddy-admin/admin.sock
+}
+
+https://PUBLIC_IP {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+	encode gzip
+
+	# No prefix wildcard. Caddy normalizes path matches; this branch never
+	# receives the injected internal credential, even for a path variant.
+	@public_health path /health
+	handle @public_health {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up -Authorization
+		}
+	}
+	handle {
+		basic_auth bcrypt "OJS API" {
+			# One username + bcrypt hash per line; include the internal operator.
+			import /etc/caddy/ojs-api-users.caddy
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			# Contains only: header_up Authorization "Basic <private value>"
+			# The upstream API still authenticates the unchanged internal account.
+			import /etc/caddy/ojs-api-upstream.caddy
+		}
+	}
+
+	# Keep authentication failures as 401, including WWW-Authenticate.
+	handle_errors 401 {
+		respond "invalid credentials" 401
+	}
+	# Only proxy-generated server errors become maintenance responses.
+	handle_errors 5xx {
+		header Retry-After "60"
+		respond "The catalogue is temporarily unavailable. Please try again later." 503
+	}
+}

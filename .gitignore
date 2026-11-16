@@ -141,6 +141,7 @@ celerybeat.pid
 .envrc
 .beacon-credentials
 .secrets/
+# Workstation-only notes and tester invitation drafts; never deploy this folder.
 .local/
 .aws/
 .ssh/

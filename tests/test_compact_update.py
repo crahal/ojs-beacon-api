@@ -466,6 +466,28 @@ class CompactUpdateTests(unittest.TestCase):
             with self.assertRaisesRegex(update.UpdateError, "on data"):
                 self.coordinator.capacity(8)
 
+    def test_runtime_scratch_reserve_is_separate_only_on_separate_filesystem(self):
+        scratch = mock.Mock(spec=Path)
+        device = self.clean.stat().st_dev
+        self.coordinator.env["OJS_SCRATCH_RESERVE_GB"] = "8"
+        with mock.patch.object(update.run_pipeline, "mysql_scratch_root", return_value=scratch), \
+                mock.patch.object(update.shutil, "disk_usage", side_effect=lambda path:
+                                  mock.Mock(free=(40 if path == self.clean else 12) * update.GIB)):
+            scratch.stat.return_value.st_dev = device + 1
+            self.coordinator.capacity(32, separate_scratch_reserve=True)
+            scratch.stat.return_value.st_dev = device
+            with self.assertRaisesRegex(update.UpdateError, "32 GiB"):
+                self.coordinator.capacity(32, separate_scratch_reserve=True)
+
+    def test_runtime_larger_scratch_reserve_is_enforced(self):
+        scratch = mock.Mock(spec=Path)
+        scratch.stat.return_value.st_dev = self.clean.stat().st_dev + 1
+        self.coordinator.env["OJS_SCRATCH_RESERVE_GB"] = "64"
+        with mock.patch.object(update.run_pipeline, "mysql_scratch_root", return_value=scratch), \
+                mock.patch.object(update.shutil, "disk_usage", return_value=mock.Mock(free=40 * update.GIB)):
+            with self.assertRaisesRegex(update.UpdateError, "64 GiB"):
+                self.coordinator.capacity(32, separate_scratch_reserve=True)
+
     def test_finalizing_candidate_blocks_download_without_discarding_work(self):
         self.args.publish_only = False
         staging = self.clean / "mysql-2026-01-01.building"

@@ -7,7 +7,9 @@ Read [processing](PROCESSING_GUIDE.md), [API contracts](HOW_TO_CALL.md) and
 
 ## Start from the canonical source
 
-Create a fresh working clone and a focused branch:
+[crahal/ojs-beacon-api](https://github.com/crahal/ojs-beacon-api) is the single
+maintained source repository. Use a canonical working clone and a focused branch;
+if you do not already have one:
 
 ```bash
 git clone https://github.com/crahal/ojs-beacon-api.git ojs_api
@@ -29,12 +31,20 @@ account email. Inspect both branch history and the PR's generated merge metadata
 do not allow a personal address just to make CI pass. Changing settings does not
 remove metadata already published or cached.
 
-This public repository has a clean source-only history. Never mirror-push an
-operational repository, push all of its refs/tags, or merge unrelated private
-history into it. To bring over a fix, apply only the reviewed source diff in
-this fresh clone, inspect every changed file and create a new commit. Do not
-copy `.git`, private notes, data, credentials or generated artifacts. Leave an
-active production/workstation checkout and its remote untouched.
+This public repository has a clean source-only history. Never mirror-push legacy
+operational history, push its refs/tags, or merge unrelated private history into
+it. Bring over a legacy fix as a reviewed source diff on a canonical branch,
+inspect every changed file and create a new commit. Any old Git-history backup
+is private archival material, not another maintained repository or a source of
+branches to merge. Ignored private notes, invitations, data, credentials and
+generated artifacts stay local; do not copy them or old `.git` metadata into a
+contribution.
+
+Source maintenance and deployment are separate. A push or merged PR does not
+automatically deploy or restart the API or pipeline. The runtime name `ojs-api`
+and installation directory `/srv/ojs_api` intentionally stay unchanged. Do not
+update application files underneath an active build; use the reviewed
+[upgrade workflow](docs/OPERATIONS.md#application-and-dependency-upgrades).
 
 ## Local checks
 

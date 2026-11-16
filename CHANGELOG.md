@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Consolidate maintained source and contribution instructions under
+  `ojs-beacon-api`; preserve existing runtime paths and service names. Repository
+  consolidation does not deploy code or alter running processing.
+- Include individual tester credentials, a guarded proxy-only activation mode,
+  and separate gateway/native revocation guidance. Keep invitation files and
+  plaintext tester keys outside source control and deployment transfers.
+- Add opt-in predecessor-export retirement only after a validated, hydrated
+  successor has a durable export checkpoint. Preserve the live rollback
+  database, event-ID allocation and interrupted-publication recovery.
+- Add a guarded, two-stage Lightsail disk-retirement script: stop/detach/restart
+  first, then deletion only after independent filesystem and API/history checks.
+- Add opt-in baseline article-payload deferral and compressed event history for
+  space-constrained VM builds. Preserve original values, hashes and deltas;
+  require checksum-bound input and byte-exact, complete hydration before export
+  or publication. Keep the existing API release online during processing.
+- Add opt-in 4 KiB physical compression for new compact builds, including
+  safe predecessor-export DDL conversion, layout-bound checkpoints and
+  multi-snapshot lossless-equivalence tests. Default storage remains unchanged.
 - Require an explicit build-workspace budget, compatible MySQL tools and a
   verified cumulative-history baseline before automatic downloads or builds.
 - Add read-only automation readiness checks and a prepare-only installer that

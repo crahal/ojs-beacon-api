@@ -57,8 +57,11 @@ survives. A missing source row is therefore not automatically a deleted article.
    containers, switches the database directory, restarts, and tests the
    authenticated API. Failed checks attempt to restore the previous release;
    an interrupted switch retains its recovery journal for inspection.
-   Eligible older large artifacts are removed only after successful publication,
-   unless retention was explicitly requested.
+   By default, eligible older large artifacts are removed only after successful
+   publication, unless retention was explicitly requested. The optional
+   [early export retirement](#optional-early-export-retirement) policy can remove
+   the previous compressed SQL export sooner, but never the still-serving
+   database.
 
 The first snapshot establishes the baseline. Processing subsequent snapshots
 against that baseline is what produces meaningful changes. Processing only the
@@ -229,10 +232,11 @@ promises. A running job does not pick up changed settings. After cancellation,
 InnoDB shutdown/rollback can outlast the deadline; the service deliberately
 does not force-kill it after a short timeout.
 
-Validated metadata checkpoints can resume, but arbitrary finalization cannot
-be replayed safely. Failed candidates are retained and block automatic new
-downloads. Do not remove the candidate, clear a publication journal, force-kill
-MySQL, or use `--force-rebuild` without reviewing the recovery procedure.
+Validated metadata and `export_ready` checkpoints have specific resume paths,
+but arbitrary finalization cannot be replayed safely. Failed candidates are
+retained and block automatic new downloads. Do not remove the candidate, clear
+a publication journal, force-kill MySQL, or use `--force-rebuild` without
+reviewing the recovery procedure.
 Specialized first-snapshot exact-key recovery is not a general later-snapshot
 resume mechanism.
 
@@ -265,6 +269,32 @@ dumps, real records, passwords, or private progress reports. If a reproducible
 audit is needed, retain authorized inputs outside Git and rebuild into a new,
 capacity-checked clean directory with the original code/configuration. Never
 run a history rebuild against the serving directory.
+
+### Optional early export retirement
+
+With `OJS_RETIRE_BASELINE_EXPORT=1`, the previous release's compressed SQL
+export can be removed before the new export is written. This saves space that
+would otherwise hold both exports at once. It requires compact storage and
+`OJS_DEFER_BASELINE_PAYLOAD=1`. All retained article payloads must first be
+restored into the new candidate, validation must pass, and a durable
+`export_ready` checkpoint must save the report and source/build/storage details.
+The previous physical database stays available for serving and rollback until
+the new release passes its publication and authenticated API checks.
+
+Before removing the exact old export, the pipeline verifies its checksum and
+release details and saves a retirement receipt. Small reports, manifests, and
+checksums are retained. An interrupted export resumes from the saved candidate
+after rechecking its source, build settings, and database; it does not repeat
+the matching/change-processing SQL or create duplicate events. Unknown or
+inconsistent recovery state is kept for review, not deleted.
+
+This option still needs a reviewed export-space budget and disk reserve.
+Actual free space is checked before writing the new export; insufficient space
+stops the build and retains the candidate for recovery. If the candidate cannot
+be recovered, preserve the old live database and regenerate its export, or
+restore a verified external backup, before rebuilding. See the
+[configuration safeguards](docs/CONFIGURATION.md#source-processing-and-safeguards)
+before enabling this option.
 
 ## Implementation map
 

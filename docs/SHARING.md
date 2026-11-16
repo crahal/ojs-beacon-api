@@ -1,15 +1,18 @@
 # Share source without operational data or history
 
-The canonical public source is
-[crahal/ojs-beacon-api](https://github.com/crahal/ojs-beacon-api), with a fresh
-source-only history. For routine contributions, clone that repository and follow
-[the contribution workflow](../CONTRIBUTING.md). Never mirror or push private
-operational history into the public repository.
+[crahal/ojs-beacon-api](https://github.com/crahal/ojs-beacon-api) is the single
+maintained source repository, with clean source-only history. Normal changes
+belong on branches of that repository; follow
+[the contribution workflow](../CONTRIBUTING.md). Never mirror, push or merge
+legacy private operational history into it. Retain any historical backup only
+as protected private archival material, outside the active development workflow.
 
-The export workflow below is for reviewing code-only source snapshots from a
-checkout that may also hold private deployment notes. It creates a **new
-code-only archive**, not a mirror, fork, Git metadata backup or history rewrite.
-Keep operational checkouts private and preserve their remotes while work is active.
+The export workflow below creates a code-only archive for review or offline
+handoff, not a second maintained repository, Git metadata backup or history
+rewrite. Ignored private files stay local. The Docker name `ojs-api` and VM
+directory `/srv/ojs_api` are intentionally unchanged runtime names, not separate
+source repositories. Pushing to the canonical repository does not deploy code;
+use the reviewed [upgrade workflow](OPERATIONS.md#application-and-dependency-upgrades).
 
 ## Check the candidate and history separately
 
@@ -67,36 +70,17 @@ Review the file listing and extracted source. Do not distribute `.local/`, the
 original `.git`, backups, `.env`, credentials or generated research data alongside
 the archive. The archive is mode 0600 locally; deliberately select its audience.
 
-## Optional: initialise a separate reviewed snapshot
+Extract archives into a new disposable directory for inspection, never over the
+live project. If review identifies changes, apply the reviewed source diff on a
+canonical branch rather than initializing or maintaining another repository.
+Preserve attribution and GPL notices in source/LICENSE. An archive is not proof
+that the deployed application matches the current canonical revision.
 
-This is for a deliberately separate source-snapshot repository, not updating
-the canonical repository or replacing its established history. Normal changes
-belong on a branch of a fresh canonical clone. If a new standalone snapshot is
-required, extract into a **new** directory, never over the live project:
+## Legacy history remains private
 
-```bash
-OJS_SHARE_DIR=$(mktemp -d /tmp/ojs-api-public.XXXXXXXX)
-tar -xzf dist/ojs-api-source.tar.gz -C "$OJS_SHARE_DIR"
-cd "$OJS_SHARE_DIR/ojs_api"
-git init -b main
-git config user.name 'Project maintainer'
-git config user.email 'maintainer@example.org'
-git add .
-python3 scripts/check_repository.py
-git diff --cached --stat
-git commit -m 'Publish reviewed code-only source'
-python3 scripts/check_repository.py --history
-```
-
-Choose a suitable public author identity before committing; `example.org` above
-is a placeholder, or use your actual GitHub **noreply** address. Attribution and
-GPL notices in source/LICENSE must remain intact. No remote is added or pushed
-by these commands. Create/review the intended GitHub repository separately before
-connecting it, and inspect visibility, Actions permissions, private vulnerability
-reporting and branch protection settings. Do not force-push over collaborators'
-existing history without an explicitly coordinated migration.
-
-This new snapshot omits old history; it does not delete private information from
-the old remote, forks, caches, issue attachments or other clones. If already
+An export or canonical-history migration does not delete private information
+from old remotes, forks, caches, issue attachments or other clones. Keep retained
+historical metadata backups private and out of source exports; do not reconnect
+them as an active contribution workflow. If sensitive material was already
 published, follow [GitHub's sensitive-data removal procedure](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
 and rotate exposed credentials. No scanner can promise to recall prior copies.

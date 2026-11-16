@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -23,6 +24,14 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pymysql.cursors import DictCursor
+
+# The API is also loaded by filename by operational checks and isolated tests.
+# Keep its sibling validator importable in that mode as well as script mode.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from api_clients import (
+    MAX_KEY_LENGTH, MAX_USERNAME_LENGTH, RegistryError, authenticate_client, read_registry,
+)
 
 DEFAULT_DB_HOST = "127.0.0.1"
 DEFAULT_DB_PORT = 3306
@@ -272,6 +281,7 @@ class APIConfig:
     snapshot_table: str
     oai_page_size: int
     public_base_url: str | None = None
+    api_clients_file: Path | None = None
 
     @property
     def article_sql(self) -> str:
@@ -934,10 +944,14 @@ def resolve_config(args: argparse.Namespace) -> APIConfig:
         public_base_url=normalize_public_base_url(
             os.getenv("OJS_PUBLIC_BASE_URL")
         ),
+        api_clients_file=(Path(os.environ["OJS_API_CLIENTS_FILE"]).expanduser()
+                          if os.getenv("OJS_API_CLIENTS_FILE") else None),
     )
 
 
 def create_app(config: APIConfig) -> FastAPI:
+    if config.api_clients_file is not None:
+        read_registry(config.api_clients_file, legacy_username=config.api_username)
     max_page_size = env_int("OJS_API_MAX_PAGE_SIZE", 200)
     if not 1 <= max_page_size <= 1000:
         raise ValueError("OJS_API_MAX_PAGE_SIZE must be between 1 and 1000")
@@ -955,21 +969,28 @@ def create_app(config: APIConfig) -> FastAPI:
     def require_auth(
         credentials: HTTPBasicCredentials = Depends(security),
     ) -> str:
-        valid_user = secrets.compare_digest(
-            credentials.username,
-            config.api_username,
+        username, password = credentials.username, credentials.password
+        bounded = (username.isascii() and password.isascii()
+                   and len(username) <= max(MAX_USERNAME_LENGTH, len(config.api_username))
+                   and len(password) <= max(MAX_KEY_LENGTH, len(config.api_password)))
+        if bounded:
+            valid_user = secrets.compare_digest(username.encode("ascii"), config.api_username.encode("utf-8"))
+            valid_password = secrets.compare_digest(password.encode("ascii"), config.api_password.encode("utf-8"))
+            if valid_user and valid_password:
+                return username
+            if config.api_clients_file is not None:
+                try:
+                    if authenticate_client(config.api_clients_file, username, password,
+                                           legacy_username=config.api_username):
+                        return username
+                except RegistryError:
+                    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                        detail="service unavailable") from None
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
         )
-        valid_password = secrets.compare_digest(
-            credentials.password,
-            config.api_password,
-        )
-        if not (valid_user and valid_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid credentials",
-                headers={"WWW-Authenticate": "Basic"},
-            )
-        return credentials.username
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
