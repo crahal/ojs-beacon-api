@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for OJS snapshot %i processing without starting a build
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=ojs-api-processing-start@%i.service
+
+[Install]
+WantedBy=timers.target

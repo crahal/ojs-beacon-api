@@ -605,6 +605,7 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
             staging = clean / "mysql-2026-01-01.building"
             original_run = run_pipeline.MySQLServer.run_sql_text
             original_start = run_pipeline.MySQLServer.start
+            original_write_state = run_pipeline.write_build_state
             preserved = ("records", "ojs_stage_source_index", "ojs_stage_sources")
             original_rows = {}
             # Reproduce the representation that failed in production: the old
@@ -628,12 +629,24 @@ WHERE oai_key_hash IS NOT NULL AND source_record_id <= 3;
                     original_rows[table] = logical_rows(server, database, table)
                 raise run_pipeline.PipelineError("simulated interrupted exact_keys INSERT")
 
+            def write_legacy_state(*args, **kwargs):
+                kwargs.pop("metadata_storage_profile", None)
+                return original_write_state(*args, **kwargs)
+
+            # Reproduce the actual legacy representation, not a modern build
+            # mislabeled as resumable: narrow metadata declarations, no width
+            # migration, and no newer metadata-storage checkpoint marker.
             with mock.patch.object(run_pipeline.MySQLServer, "run_sql_text", new=interrupted_run), \
+                    mock.patch.object(run_pipeline, "render_metadata_storage_sql", side_effect=lambda sql: sql), \
+                    mock.patch.object(run_pipeline, "migrate_metadata_storage", return_value={}), \
+                    mock.patch.object(run_pipeline, "write_build_state", side_effect=write_legacy_state), \
                     self.assertRaisesRegex(run_pipeline.PipelineError, "simulated interrupted"):
                 run_pipeline.build_snapshot_database(
                     **options, clean_dir=clean, resume_building=False, compact_storage=True,
                 )
-            self.assertEqual(run_pipeline.read_build_state(staging)["phase"], "finalizing")
+            checkpoint = run_pipeline.read_build_state(staging)
+            self.assertEqual(checkpoint["phase"], "finalizing")
+            self.assertNotIn("metadata_storage_profile", checkpoint)
             staging_inode = staging.stat().st_ino
             identities = {
                 name: (staging / database / f"{name}.ibd").stat().st_ino

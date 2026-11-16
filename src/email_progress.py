@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Send a small, read-only recovery snapshot through Gmail.
+"""Send a small, read-only API and update-job snapshot through Gmail.
 
 Only systemd properties, a bounded journal tail, filesystem free space, and
-host memory are observed. This program never opens a database or loads .env.
+host memory are observed, plus optional bounded HTTPS API checks. This program
+never opens a database directly or loads .env. API credentials are supplied
+through systemd's private credential directory, independently of email secrets.
 Journal text and exceptions are untrusted and must never enter the report.
 """
 
@@ -28,6 +30,9 @@ import tempfile
 import time
 
 import progress_llm
+import progress_api
+import progress_activity
+import processing_start_notice
 from progress_observations import observed_activity, recent_milestones
 from progress_summary import overview, stage_info
 
@@ -45,7 +50,7 @@ MILESTONE_PATTERN = (
     r'update-build|update-recover-exact-keys)")'
 )
 STALE_SECONDS = 300
-MIN_SEND_INTERVAL_SECONDS = 11 * 60 * 60
+MIN_SEND_INTERVAL_SECONDS = 72 * 60 * 60
 MAX_STATE_BYTES = 16 * 1024
 PROPERTIES = (
     "ActiveState", "SubState", "Result", "InvocationID", "MainPID",
@@ -285,6 +290,17 @@ def collect_snapshot(project_root: Path) -> dict:
                 "milestones": [], "activity": {},
                 "warnings": [], "root_free": free_bytes(Path("/")),
                 "data_free": free_bytes(project_root / "data"), "memory": host_memory()}
+    # Observe serving independently: a failed/absent build unit must never
+    # short-circuit the live availability check or masquerade as an API outage.
+    snapshot["api"] = progress_api.collect_api()
+    # Standalone downloads/publication are not children of the daily updater.
+    # Observe them even when that updater retains an old failure or is absent.
+    snapshot["workload"] = progress_activity.collect_activity(diagnostic=diagnostic)
+    snapshot["scheduler"] = {
+        "updates_paused": path_present(project_root / "data/.updates-paused"),
+        "cron_installed": path_present(Path("/etc/cron.d/ojs-api")),
+    }
+    snapshot["observed_at"] = stamp(utc_now())
     try:
         service = read_service()
         snapshot["service"] = service
@@ -329,6 +345,63 @@ def collect_snapshot(project_root: Path) -> dict:
     return snapshot
 
 
+def path_present(path: Path) -> bool | None:
+    try:
+        path.stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+
+def scheduler_evidence(snapshot: dict) -> dict:
+    raw = snapshot.get("scheduler")
+    raw = raw if isinstance(raw, dict) else {}
+    return {key: raw.get(key) if type(raw.get(key)) is bool else None
+            for key in ("updates_paused", "cron_installed")}
+
+
+def availability_summary(snapshot: dict, previous: dict | None = None) -> tuple[str, list[str]]:
+    api = progress_api.sanitize_api(snapshot.get("api"))
+    status = api["status"]
+    descriptions = {
+        "serving": ("Serving", "API: serving the published catalogue; HTTPS health, authenticated metadata, history and an article sample passed."),
+        "unavailable": ("Check failed", "API: a live request failed or timed out; availability could not be verified. This is separate from update-job status."),
+        "auth_failed": ("Authentication failed", "API: the monitoring credentials were rejected; authenticated catalogue access could not be verified."),
+        "unverified": ("Unverified", "API: serving status could not be verified; monitoring configuration or an unexpected response may be responsible."),
+        "not_configured": ("Not checked", "API: live checks are not configured; update-job status does not establish API availability."),
+    }
+    label, description = descriptions[status]
+    lines = [description]
+    if status != "serving" and api.get("health") == "ok":
+        lines.append("The unauthenticated health endpoint responded, but catalogue checks did not all pass.")
+    if status == "serving":
+        lines.append("Published snapshot: " + api["latest_snapshot"] + ".")
+        lines.append("Available snapshot history: " + ", ".join(api["snapshot_dates"]) + ".")
+        counts = [("active_articles", "active articles"), ("total_articles", "retained articles"),
+                  ("active_sources", "active sources")]
+        values = [f"{api[key]:,} {name}" for key, name in counts if key in api]
+        if values:
+            lines.append("Catalogue: " + "; ".join(values) + ".")
+        before = progress_api.sanitize_api((previous or {}).get("api"))
+        if before["status"] == "serving" and before.get("latest_snapshot") != api["latest_snapshot"]:
+            lines.append("Published snapshot changed since the previous email: "
+                         + before["latest_snapshot"] + " → " + api["latest_snapshot"] + ".")
+    scheduler = scheduler_evidence(snapshot)
+    if scheduler["updates_paused"] is True:
+        lines.append("Automatic updates: paused for new work by the update pause flag; existing builds and serving are independent.")
+    elif scheduler["updates_paused"] is False:
+        lines.append("Update pause flag: absent; this alone does not prove scheduling is enabled.")
+    else:
+        lines.append("Update pause flag: unavailable.")
+    if scheduler["cron_installed"] is False:
+        lines.append("Daily updater cron: not installed at the standard location.")
+    elif scheduler["cron_installed"] is True:
+        lines.append("Daily updater cron: file present; schedule execution is not verified by this check.")
+    return label, lines
+
+
 def service_status(service: dict) -> tuple[str, str]:
     active, result = service.get("ActiveState"), service.get("Result")
     if active == "failed" or (active == "inactive" and result not in (None, "success")):
@@ -368,15 +441,23 @@ def read_state(path: Path) -> dict | None:
             return None
         return {"schema": 1, "invocation": invocation, "stage": stage, "step": step,
                 "sent_at": stamp(sent_at), "logged_at": stamp(logged_at) if logged_at else None,
+                "api": progress_api.sanitize_api(raw.get("api")),
+                processing_start_notice.RECEIPT_FIELD: processing_start_notice.valid_receipt(
+                    raw.get(processing_start_notice.RECEIPT_FIELD)),
                 "counters": {key: value for key in COUNTERS
                              if (value := number(raw["counters"].get(key))) is not None}}
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
 
-def comparable_state(snapshot: dict, sent_at: datetime) -> dict:
+def comparable_state(snapshot: dict, sent_at: datetime, previous: dict | None = None) -> dict:
     event = snapshot.get("event") or {}
     return {"schema": 1, "sent_at": stamp(sent_at),
+            "api": progress_api.sanitize_api(snapshot.get("api")),
+            # Retain successful one-time notice delivery through all later
+            # ordinary reports; erasing it would permit a duplicate notice.
+            processing_start_notice.RECEIPT_FIELD: processing_start_notice.valid_receipt(
+                (previous or {}).get(processing_start_notice.RECEIPT_FIELD)),
             "invocation": snapshot["service"].get("InvocationID"),
             "stage": event.get("stage"), "step": event.get("step"),
             "logged_at": event.get("logged_at"),
@@ -448,6 +529,22 @@ def llm_evidence(snapshot: dict, previous: dict | None) -> dict:
         "overall_completion_verified": False,
         "api_availability_verified": False,
     }
+    evidence["api"] = progress_api.sanitize_api(snapshot.get("api"))
+    evidence["api_availability_verified"] = evidence["api"]["status"] == "serving"
+    evidence["scheduler"] = scheduler_evidence(snapshot)
+    workload = progress_activity.sanitize_activity(snapshot.get("workload"))
+    evidence["workload"] = {
+        "status": workload["status"],
+        "observations_incomplete": not workload.get("discovery_complete") or any(
+            job["status"] == "unknown" for job in workload["jobs"]),
+        "jobs": [{"role": ("daily updater" if job["unit"] == progress_activity.FIXED_UNITS[0]
+                           else "November downloader" if job["unit"] == progress_activity.FIXED_UNITS[1]
+                           else "release publication"),
+                  "status": job["status"],
+                  **({"stage": job["stage"]} if "stage" in job else {})}
+                 for job in workload["jobs"]],
+    }
+    evidence["service_scope"] = "Update job only; its result does not establish live API availability."
     event = snapshot.get("event") or {}
     stage, event_type, step = event.get("stage"), event.get("event"), event.get("step")
     if not isinstance(stage, str) or stage not in STAGES:
@@ -541,14 +638,19 @@ def ai_assessment(snapshot: dict, previous: dict | None, state_file: Path) -> st
 def render_report(snapshot: dict, previous: dict | None = None) -> tuple[str, str]:
     service, event = snapshot["service"], snapshot.get("event")
     status, description = service_status(service)
-    label, _ = stage_info((event or {}).get("stage"), (event or {}).get("step"))
-    observed, logged = parse_stamp(snapshot.get("observed_at")), parse_stamp((event or {}).get("logged_at"))
-    age = (observed - logged).total_seconds() if observed and logged else -1
-    if status != "Running" or not 0 <= age <= STALE_SECONDS or (event or {}).get("event") in {"completed", "failed"}:
-        label = "Last stage: " + label
-    subject = f"[OJS recovery] {status} | {label} - {snapshot['observed_at']}"
-    lines = ["OJS recovery progress report", "Observed (UTC): " + snapshot["observed_at"],
-             "", *overview(snapshot, previous), "", "Technical details", description, "Service: " + SERVICE,
+    api_label, api_lines = availability_summary(snapshot, previous)
+    work = progress_activity.sanitize_activity(snapshot.get("workload"))["status"].replace("_", " ").capitalize()
+    subject = f"[OJS API] {api_label} | work: {work} | update job: {status} - {snapshot['observed_at']}"
+    job_lines = overview(snapshot, previous)
+    if status == "Failed":
+        job_lines = ["Update job: its last run failed; no update is running in this unit.",
+                     "This retained failure is not evidence that the published API is down."]
+    elif status in {"Idle", "Job exited"}:
+        job_lines = ["Update job: inactive; live API availability is checked separately."]
+    lines = ["OJS API and update progress report", "Observed (UTC): " + snapshot["observed_at"],
+             "", *api_lines, "", *progress_activity.activity_summary(snapshot.get("workload")),
+             "", "Update job", *job_lines,
+             "", "Technical details", "Update-job observation (not API availability): " + description, "Service: " + SERVICE,
              "Systemd: " + "; ".join(f"{key}={service.get(key, 'unavailable')}"
                                         for key in ("ActiveState", "SubState", "Result", "MainPID")),
              "Invocation: " + service.get("InvocationID", "unavailable"), ""]
@@ -585,7 +687,8 @@ def render_report(snapshot: dict, previous: dict | None = None) -> tuple[str, st
                   "Disk free, root / project data: " + quantity(snapshot["root_free"])
                   + " / " + quantity(snapshot["data_free"]),
                   "", "Heartbeats indicate that the monitor is alive, not that SQL is advancing.",
-                  "No overall percentage or ETA is inferred. Only systemd, bounded journal tails, and host resources were read."])
+                  "No overall percentage or ETA is inferred. Observations use systemd, bounded journal tails, host resources and optional bounded HTTPS API reads.",
+                  "API checks run from this host, not an independent external monitor, and do not scan every record or establish completion of a new build."])
     lines.extend(snapshot["warnings"])
     return subject, "\n".join(lines) + "\n"
 
@@ -688,13 +791,13 @@ def write_state(path: Path, state: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Print safe preview; do not read credentials, send, or write state.")
+    mode.add_argument("--dry-run", action="store_true", help="Print safe preview; optional API credentials/checks only; no email/AI credentials, sending, or state writes.")
     mode.add_argument("--preview-llm", action="store_true", help="Explicit paid AI preview; no email or delivery-state change; normal AI attempt caps apply.")
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--password-file", type=Path, help="Explicit credential path for manual use.")
     parser.add_argument("--min-send-interval-hours", type=int, default=MIN_SEND_INTERVAL_SECONDS // 3600,
-                        help="Minimum interval between accepted messages for this state file (default: 11 hours).")
+                        help="Minimum interval between accepted messages for this state file (default: 72 hours).")
     parser.add_argument("--lock-wait-seconds", type=int, default=0,
                         help="Wait up to this many seconds for another recipient's report (0 through 60).")
     parser.add_argument("--force", action="store_true", help="Bypass the recipient's minimum send interval, but not AI limits.")
@@ -736,13 +839,20 @@ def main(argv: list[str] | None = None) -> int:
                 print("Progress report skipped: another report is in progress.")
                 return 0
             previous = read_state(args.state_file)
+            notice = processing_start_notice.configured_notice()
+            start_notice_pending = processing_start_notice.pending_notice(notice, previous)
             sent_at = parse_stamp(previous.get("sent_at")) if previous else None
-            if (not args.force and sent_at is not None
+            if (not args.force and not start_notice_pending and sent_at is not None
                     and (utc_now() - sent_at).total_seconds() < args.min_send_interval_hours * 3600):
                 print("Recent progress report already sent; skipped.")
                 return 0
             snapshot = collect_snapshot(args.project_root)
             subject, body = render_report(snapshot, previous)
+            if start_notice_pending:
+                # This is a historical, observed start, not an assertion that
+                # SQL is still running when this later email is delivered.
+                subject = f"[OJS API] Processing started: {notice['snapshot_date']} | " + subject.removeprefix("[OJS API] ")
+                body = processing_start_notice.notice_line(notice) + "\n\n" + body
             password = read_password(args.password_file)
             if os.environ.get("OJS_PROGRESS_LLM_ENABLED") == "1":
                 try:
@@ -757,12 +867,18 @@ def main(argv: list[str] | None = None) -> int:
                     print("AI assessment unavailable; sending factual report.")
             send_email(sender, recipient, password, subject, body)
             accepted = True
-            write_state(args.state_file, comparable_state(snapshot, utc_now()))
+            delivered = comparable_state(snapshot, utc_now(), previous)
+            if start_notice_pending:
+                delivered[processing_start_notice.RECEIPT_FIELD] = processing_start_notice.notice_token(notice)
+            write_state(args.state_file, delivered)
         print("Progress email accepted by SMTP; comparison state saved.")
         return 0
     except Exception:
         if accepted:
             print("Progress email accepted by SMTP, but comparison state could not be saved.", file=sys.stderr)
+            # The one-time notice watcher holds this recipient for operator
+            # review instead of retrying an already accepted message.
+            return 2
         else:
             print("Progress email was not sent; check reporting configuration and service diagnostics.", file=sys.stderr)
         return 1

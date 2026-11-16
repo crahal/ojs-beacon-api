@@ -79,7 +79,7 @@ class ProgressRecipientDeploymentTests(unittest.TestCase):
     def test_service_timeout_preserves_work_allowance_after_bounded_lock_wait(self):
         base = configuration(BASE_SERVICE)["Service"]
         subscriber = configuration(SUBSCRIBER_SERVICE)["Service"]
-        self.assertEqual(int(subscriber["TimeoutStartSec"]), 240)
+        self.assertEqual(int(subscriber["TimeoutStartSec"]), 360)
         self.assertEqual(
             int(subscriber["TimeoutStartSec"]), int(base["TimeoutStartSec"]) + 60,
         )
@@ -94,12 +94,18 @@ class ProgressRecipientDeploymentTests(unittest.TestCase):
         })
         self.assertEqual(timer["Install"]["WantedBy"], "timers.target")
 
-    def test_original_recipient_schedule_remains_twelve_hours(self):
+    def test_primary_and_subscriber_share_three_day_cadence_and_durable_minimum(self):
         timer = configuration("deploy/ojs-api-progress-email.timer")["Timer"]
-        self.assertEqual(timer["OnActiveSec"], "12h")
-        self.assertEqual(timer["OnUnitActiveSec"], "12h")
+        self.assertEqual(timer["OnActiveSec"], "72h")
+        self.assertEqual(timer["OnUnitInactiveSec"], "72h")
         self.assertEqual(timer["Unit"], "ojs-api-progress-email.service")
-        self.assertNotIn("OnUnitInactiveSec", timer)
+        self.assertNotIn("OnUnitActiveSec", timer)
+        subscriber_timer = configuration(SUBSCRIBER_TIMER)["Timer"]
+        for key in ("OnActiveSec", "OnUnitInactiveSec", "AccuracySec"):
+            self.assertEqual(timer[key], subscriber_timer[key])
+        for service_path in (BASE_SERVICE, SUBSCRIBER_SERVICE):
+            arguments = shlex.split(configuration(service_path)["Service"]["ExecStart"])
+            self.assertIn("--min-send-interval-hours=72", arguments)
         self.assertEqual(directives(BASE_SERVICE, "EnvironmentFile"), [
             "/etc/ojs-api/progress-email.env",
         ])

@@ -20,6 +20,15 @@ SECRET = "sk-test-" + "privateDoNotEcho" * 3
 TEXT = "The rollback monitor is still reporting activity. A heartbeat alone does not establish forward progress."
 EVIDENCE = {"service_status": "running", "stage": "recovery-rollback",
             "freshness": "recent", "counters": {"remaining_rows": 29001002}}
+SERVING_EVIDENCE = {
+    **EVIDENCE, "service_status": "failed",
+    "api": {"status": "serving", "health": "ok", "latest_snapshot": "2026-10-01",
+            "snapshot_dates": ["2026-01-01", "2026-07-01", "2026-10-01"]},
+    "api_availability_verified": True,
+    "scheduler": {"updates_paused": True, "cron_installed": False},
+}
+SERVING_TEXT = ("The API is serving the published catalogue. "
+                "Automatic updates are paused, and the updater's previous run reported a failure.")
 
 
 def response(text=TEXT, **changes):
@@ -134,6 +143,23 @@ class BudgetTests(unittest.TestCase):
                 self.generate()
         self.assertEqual(raised.exception.reason, "output_incomplete")
         self.assertSafe(raised.exception)
+        network.assert_called_once()
+        self.assertEqual(json.loads(self.budget.read_text())["day_attempts"], 1)
+
+    def test_live_api_evidence_reaches_output_validation_despite_failed_updater(self):
+        with mock.patch.object(llm, "_bounded_request", return_value=response(SERVING_TEXT)) as network:
+            self.assertEqual(self.generate(evidence=SERVING_EVIDENCE), SERVING_TEXT)
+        payload = json.loads(network.call_args.args[0])
+        self.assertEqual(json.loads(payload["input"]), SERVING_EVIDENCE)
+        network.assert_called_once()
+
+    def test_contradictory_api_summary_falls_back_without_retry(self):
+        with mock.patch.object(llm, "_bounded_request", return_value=response(
+                "The updater reported a failure. Overall recovery and API availability remain unverified.")) as network:
+            with self.assertRaises(llm.SummaryUnavailable) as raised:
+                self.generate(evidence=SERVING_EVIDENCE)
+        self.assertEqual(raised.exception.reason, "output_content")
+        self.assertIn("api_status_contradiction", raised.exception.checks)
         network.assert_called_once()
         self.assertEqual(json.loads(self.budget.read_text())["day_attempts"], 1)
 
@@ -260,7 +286,10 @@ class RequestTests(unittest.TestCase):
         self.assertLessEqual(len(decoded["instructions"].encode()) + len(decoded["input"].encode()), 8192)
         self.assertEqual(json.loads(decoded["input"]), EVIDENCE)
         self.assertNotIn(SECRET, payload.decode())
-        self.assertIn("Overall recovery and API availability remain unverified.", decoded["instructions"])
+        self.assertIn("Overall recovery remains unverified.", decoded["instructions"])
+        self.assertNotIn("Overall recovery and API availability remain unverified.", decoded["instructions"])
+        self.assertIn("service_status describes the updater job, not API availability", decoded["instructions"])
+        self.assertIn("api_availability_verified is true", decoded["instructions"])
         self.assertIn("even in negations", decoded["instructions"])
 
     def https_fixture(self, *, code=200, body=None, headers=None):
@@ -351,6 +380,86 @@ class RequestTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_verified_api_serving_is_allowed_independent_of_failed_updater(self):
+        self.assertEqual(llm._summary(response(SERVING_TEXT), SERVING_EVIDENCE), SERVING_TEXT)
+        for service_status in ("running", "stopped", "exited", "unknown"):
+            with self.subTest(service_status=service_status):
+                evidence = {**SERVING_EVIDENCE, "service_status": service_status}
+                self.assertEqual(llm._summary(response(SERVING_TEXT), evidence), SERVING_TEXT)
+
+    def test_catalogue_build_prose_can_accompany_a_live_api(self):
+        evidence = {**SERVING_EVIDENCE, "service_status": "running",
+                    "scheduler": {"updates_paused": False, "cron_installed": True},
+                    "stage_label": "Building the article catalogue"}
+        for updater in (
+            "The updater is building the article catalogue and change history.",
+            "The updater is constructing the catalogue while measured process activity continues.",
+            "Building the article catalogue is the current updater stage.",
+        ):
+            text = "The API is serving the published catalogue. " + updater
+            with self.subTest(updater=updater):
+                self.assertEqual(llm._summary(response(text), evidence), text)
+        legacy = "The updater is building the article catalogue. Overall recovery remains unverified."
+        self.assertEqual(llm._summary(response(legacy), EVIDENCE), legacy)
+
+    def test_unverified_api_cannot_be_reported_as_serving(self):
+        cases = [None, EVIDENCE,
+                 {**SERVING_EVIDENCE, "api_availability_verified": False},
+                 {**SERVING_EVIDENCE, "api_availability_verified": "true"},
+                 {**SERVING_EVIDENCE, "api_availability_verified": 1},
+                 {**SERVING_EVIDENCE, "api": {"status": "serving", "health": "unknown"}},
+                 {**SERVING_EVIDENCE, "api": {"status": "unverified", "health": "ok"}},
+                 {"service_status": "exited_successfully", "api": {"status": "unverified"}}]
+        for evidence in cases:
+            with self.subTest(evidence=evidence), self.assertRaises(llm.SummaryUnavailable):
+                llm._summary(response(SERVING_TEXT), evidence)
+
+    def test_api_check_failure_is_not_invented_outage_or_build_completion(self):
+        for status in ("unavailable", "auth_failed", "unverified", "not_configured"):
+            evidence = {**EVIDENCE, "api": {"status": status, "health": "unknown"},
+                        "api_availability_verified": False}
+            text = llm.API_STATUS_SENTENCES[status] + " The updater is still being monitored."
+            with self.subTest(status=status):
+                self.assertEqual(llm._summary(response(text), evidence), text)
+
+    def test_missing_or_malformed_api_observation_fails_closed(self):
+        text = "API availability remains unverified. The updater is still being monitored."
+        cases = [{"api": None}, {"api": []}, {"api": {}}, {"api": {"status": []}},
+                 {"api_availability_verified": True},
+                 {"api": {"status": "serving", "health": "ok"}}]
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                self.assertEqual(llm._summary(response(text), evidence), text)
+
+    def test_live_api_cannot_be_contradicted_or_used_to_claim_build_completion(self):
+        contradictory = (
+            "The updater reported a failure. Overall recovery and API availability remain unverified.",
+            "The API is unavailable. The updater is stopped.",
+            "The API is serving the published catalogue. API availability remains unverified.",
+            "The API is serving the published catalogue. The endpoint is offline.",
+            "The API is serving the published catalogue. It is offline now.",
+            "The API is serving the published catalogue. Catalogue availability remains unverified.",
+            "The API is serving the published catalogue. The catalogue is currently unavailable.",
+            "The API is serving the published catalogue. The system is healthy.",
+            "The API is serving the published catalogue. All recovery work has finished.",
+            "The API is serving the published catalogue. The overall recovery is complete.",
+            "The API is serving the published catalogue. The API is serving the published catalogue.",
+        )
+        for text in contradictory:
+            with self.subTest(text=text), self.assertRaises(llm.SummaryUnavailable):
+                llm._summary(response(text), SERVING_EVIDENCE)
+
+    def test_api_claim_without_api_evidence_is_rejected_but_uncertainty_allowed(self):
+        for text in ("The API is serving. The updater is active.",
+                     "The API is online. The updater is active.",
+                     "The catalogue is accessible. The updater is active.",
+                     "It is serving again. The updater is active.",
+                     "The API is unavailable. The updater is stopped."):
+            with self.subTest(text=text), self.assertRaises(llm.SummaryUnavailable):
+                llm._summary(response(text), EVIDENCE)
+        text = "The updater reported a failure. Overall recovery and API availability remain unverified."
+        self.assertEqual(llm._summary(response(text), EVIDENCE), text)
+
     def test_all_content_failures_have_closed_diagnostics_without_response_text(self):
         text = "Recovery is complete in two hours. Restart at https://private.example.org/" + SECRET + "/123."
         with self.assertRaises(llm.SummaryUnavailable) as raised:

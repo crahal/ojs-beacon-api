@@ -181,5 +181,22 @@ class ComposeDefaultsTests(unittest.TestCase):
                 self.assertIn(script, match.group(1))
 
 
+class PublicationWorkflowTests(unittest.TestCase):
+    def test_ci_checks_full_public_history_without_persisting_credentials(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        portable = workflow.split("  portable-tests:\n", 1)[1].split("\n  api-image:", 1)[0]
+        checkout = portable.split("      - uses: actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("          fetch-depth: 0", checkout)
+        self.assertIn("          persist-credentials: false", checkout)
+        self.assertIn("run: make check-repository", portable)
+        self.assertIn("run: make check-history", portable)
+        self.assertLess(portable.index("run: make check-history"), portable.index("run: make test"))
+
+    def test_contributor_checks_cover_commit_metadata_before_upload(self):
+        guidance = (ROOT / "CONTRIBUTING.md").read_text()
+        self.assertIn("after creating your commit and before pushing", guidance)
+        self.assertIn("cannot prevent an initial disclosure", guidance)
+
+
 if __name__ == "__main__":
     unittest.main()

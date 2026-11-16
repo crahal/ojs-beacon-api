@@ -73,7 +73,7 @@ class FakeRunner:
         self.root = root
         self.commands = []
         self.children = []
-        self.probe = {"needs_download": True, "known_snapshot": None}
+        self.probe = {"needs_download": True, "known_snapshot": None, "remote": {"size": 64}}
         self.mount = None
         self.other_mounts = []
         self.on_child = None
@@ -114,6 +114,7 @@ class FakeRunner:
 class FakeCoordinator(update.Coordinator):
     def __init__(self, args, runner):
         super().__init__(args, runner)
+        self.env["OJS_BUILD_WORKSPACE_GB"] = "0.001"
         self.health_calls = []
         self.cold_checks = []
         self.fail_health = False
@@ -506,7 +507,7 @@ class CompactUpdateTests(unittest.TestCase):
         self.runner.other_mounts = [staging]
         with self.assertRaisesRegex(update.UpdateError, "mounted or used"):
             self.coordinator.execute()
-        self.assertEqual(len(self.runner.children), 1)  # Download only.
+        self.assertEqual(len(self.runner.children), 0)  # Refuse before downloading.
         self.assertTrue(staging.exists())
 
     def test_same_release_retry_keeps_previous_deletion_audit(self):

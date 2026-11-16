@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: credentials lightsail-preflight update automatic-update check-source publish-live download scrape scrape-check rebuild-history verify verify-deep test compose check-repository check-history export-public
+.PHONY: credentials lightsail-preflight update automatic-update check-source automatic-readiness publish-live download scrape scrape-check rebuild-history verify verify-deep test compose check-repository check-history export-public
 
 credentials:
 	./scripts/generate_api_credentials.sh
@@ -19,6 +19,9 @@ publish-live:
 
 check-source:
 	./scripts/automatic_update.sh --check
+
+automatic-readiness:
+	./scripts/automatic_update.sh --readiness
 
 download:
 	$(PYTHON) src/run_pipeline.py --download-only

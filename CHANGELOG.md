@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Require an explicit build-workspace budget, compatible MySQL tools and a
+  verified cumulative-history baseline before automatic downloads or builds.
+- Add read-only automation readiness checks and a prepare-only installer that
+  preserves pause controls and existing systemd overrides.
+- Refuse cleanup when filesystem mounts alias protected source or live data.
+- Separate authenticated live-API availability from updater history and current
+  download, validation, processing and publication activity in progress reports.
+- Add opt-in, receipt-tracked processing-start notices followed by independent
+  three-day reporting schedules, with ambiguous delivery held for review.
+- Scan full public Git history and commit identities in CI, with an explicit
+  local pre-push privacy check to prevent initial disclosure.
 - Replace machine-specific deployment notes with portable deployment, API,
   processing, configuration and operations guides.
 - Add current-tree/history privacy checks and deterministic code-only exports.

@@ -72,6 +72,55 @@ full check/download/build/publish workflow, **not** a download-only scheduler.
 Enable it only after the next full build's resource budget and backups have
 been approved. Import-only serving can remain paused indefinitely.
 
+### Prepare without starting builds
+
+On the standard `/srv/ojs_api` installation:
+
+```bash
+cd /srv/ojs_api
+sudo ./scripts/install_automatic_updates.sh
+sudo -u ojs -H bash -lc 'cd /srv/ojs_api && make automatic-readiness'
+```
+
+Preparation installs an absent update service, stages the daily cron entry at
+`/etc/ojs-api-cron.paused`, and creates or preserves `data/.updates-paused`.
+It never enables a scheduler, starts/stops a job, replaces differing
+configuration, or removes recovery/storage-migration drop-ins. It refuses
+an active updater, an installed active cron entry or an active/enabled timer;
+inspect the existing setup rather than trying to force installation.
+
+Readiness reports build blockers separately from activation blockers. A running
+download/wrangle, missing history export, unreviewed space budget or insufficient
+capacity blocks admission. Pause markers and `RefuseManualStart=yes` remain
+intentional independent barriers. A failed old updater is not evidence that
+the live API is down; check the API separately.
+
+Before activation, set reviewed positive `OJS_BUILD_WORKSPACE_GB` and (when
+using configured scratch) `OJS_BUILD_SCRATCH_GB` in the private `.env`. See the
+[budget semantics](CONFIGURATION.md#source-processing-and-safeguards).
+Record a complete build's peak and allow growth headroom. Never equate the
+20 GiB minimum floor with enough space for the candidate. Re-run readiness
+after the current work finishes; it is only a point-in-time observation.
+
+### Activate only after review
+
+Complete these checks before using the activation commands below:
+
+1. Readiness has `ready_for_build=true`; no pending publication recovery or
+   unreviewed failed candidate remains. Check preflight and authenticated API
+   history independently, and verify recoverable backups.
+2. Review `systemctl cat ojs-api-update.service` locally. Retire only specifically
+   reviewed recovery/migration overrides; retain memory limits, scratch access
+   and mount dependencies. Do not remove the entire drop-in directory.
+3. Confirm `systemctl show ojs-api-update.service -p RefuseManualStart` reports
+   `no`, and no download/build/publication is advancing.
+4. Review `/etc/cron.d`, root/user crontabs and any timers for duplicate jobs.
+   Use one scheduler. If storage uses bind mounts, configure mandatory boot
+   dependencies for both the backing volume and exact serving bind target.
+
+The following commands are for activation **after** these checks, not part of
+preparation. They do not grant permission to delete data or relocate storage.
+
 ```bash
 cd /srv/ojs_api
 sudo timedatectl set-timezone UTC
@@ -97,6 +146,22 @@ The next cron run checks upstream validators. Unchanged data is a cheap no-op;
 changed data is downloaded, checked and processed. The SQL footer determines
 the snapshot date, not HTTP Last-Modified. Same-date content revisions stop for
 review rather than overwriting history.
+
+New automatic builds require the live release's intact export, checksums,
+manifest and matching change report. They cannot silently start fresh if that
+history is missing. A newer unpublished artifact requires review rather than
+automatic adoption. Cumulative article identifiers and delta history are then
+carried forward through the baseline import; raw snapshots alone are not a
+substitute for this published-history check.
+
+Publication keeps the previous API in place during construction and rolls back
+if switching/health checks fail. After successful verification, normal bounded
+retention may delete older generated databases/exports: this is **not** permanent
+rollback retention. Use reviewed backups or `--no-prune` when retaining the old
+release, with enough space for it. Cleanup refuses mounted artifacts, nested
+mounts and bind-source aliases, including a mount created after its cleanup
+plan. A retained bind mount may need later manual retirement; do not let that
+unmeasured retained storage accumulate across builds.
 
 All repository source-changing entrypoints share `data/raw/.source-activity.lock`
 through download, processing and publication. Another managed downloader/build
@@ -349,16 +414,79 @@ at their issuer; deleting them from the latest Git tree is not revocation.
 ## Optional progress email
 
 Email reporting is independent of serving and not required for deployment. The
-default reporter observes `ojs-api-update.service`; it does not automatically
-follow a desktop transfer or a differently named publication unit. Confirm its
-target before treating an email as current deployment status. It is not an
-external availability monitor and a summary is not proof of successful release.
+reporter separates **live catalogue availability** from **update-job progress**.
+With the optional API observation configured below, it makes bounded read-only
+HTTPS requests using the existing client credential. The report can therefore
+show a healthy published catalogue alongside a failed previous update job;
+that old job failure alone is not an API outage.
 
-Preview locally without sending mail or loading credentials:
+Every report explicitly states both API availability and current processing
+activity, including idle or unverified states. The detailed updater history
+remains scoped to `ojs-api-update.service`. A separate bounded observer also
+checks `ojs-november-download.service` and up to four dated
+`ojs-api-publish-YYYY-MM-DD.service` units. A download is not wrangling; validation,
+processing, publication and shutdown have separate labels. Only fresh progress
+from the current service invocation establishes a current stage. Arbitrary
+processes and desktop jobs are outside this monitor's scope.
+
+The pause flag prevents new automatic download/build/publication work; it does
+not stop an already-running build or the serving API. Missing observations are
+labelled unverified, not inferred from an old log. A failed updater's historical
+status is shown separately from an independently running download.
+
+Without API observation configured, preview the job-only report locally without
+sending mail or loading mail/AI credentials:
 
 ```bash
 sudo runuser -u ojs -g systemd-journal -- python3 -B /srv/ojs_api/src/email_progress.py --dry-run
 ```
+
+### Observe the live API
+
+Install the reviewed reporter, probe module and helpers in the operational
+checkout first. Substitute the actual public HTTPS origin below; do not put a
+username or key in the URL. The helper writes only `/etc/ojs-api/progress-api.env`
+as root:root mode 600. An identical existing setting is a no-op; a different
+setting or unsafe file is refused. It never reads keys or changes a service.
+
+```bash
+cd /srv/ojs_api
+sudo python3 scripts/configure_progress_api.py --base-url https://api.example.org &&
+sudo bash scripts/preview_progress_report.sh
+```
+
+Review that factual preview before installing the drop-in. This preview uses
+the API credential, but no Gmail or OpenAI credential, no paid AI requests, and
+no email or report-state writes. It runs inside a bounded read-only systemd
+sandbox. The production report also receives only a systemd copy of the client
+credential: `.env`, the source `.secrets` directory and Docker socket stay
+inaccessible.
+
+Apply to both the primary service and any existing subscriber-template services:
+
+```bash
+cd /srv/ojs_api
+sudo install -d -o root -g root -m 755 /etc/systemd/system/ojs-api-progress-email.service.d /etc/systemd/system/ojs-api-progress-email@.service.d
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email-api.conf /etc/systemd/system/ojs-api-progress-email.service.d/20-api.conf
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email-api.conf /etc/systemd/system/ojs-api-progress-email@.service.d/20-api.conf
+sudo systemctl daemon-reload
+sudo systemctl list-timers 'ojs-api-progress-email*' --all --no-pager
+```
+
+These commands do not change timer intervals, recipients, AI configuration,
+automatic-update scheduling, API containers or MySQL. Existing subscribers
+receive the new report on their next scheduled send. No additional message is
+sent during setup.
+
+The checks originate **on the VM**, through its configured HTTPS origin. They
+verify sampled endpoint responses, not all data, full history consistency,
+backup restorability, or access from another network. A powered-off or isolated
+VM cannot email its own failure: keep a separate external availability check.
+Healthy serving can still be stale; compare the observed latest snapshot with
+the release you intended to publish. A job heartbeat alone is not SQL progress,
+and neither elapsed time nor an AI interpretation establishes a reliable ETA.
+
+### Configure email delivery
 
 For an approved Gmail sender, create a dedicated app password privately and use
 the helper's hidden prompt; never paste it into chat or command arguments.
@@ -384,8 +512,12 @@ schedule. If the test did not arrive, disable the timer while investigating:
 sudo systemctl list-timers ojs-api-progress-email.timer --all --no-pager
 ```
 
-The timer sends every 12 hours, restarting its interval after reboot; missed
-messages are not replayed. The configuration helper refuses to overwrite
+The primary and subscriber timers send every three days (72 hours after their
+report service becomes inactive). Each recipient also has an independent
+persistent 72-hour minimum-send guard. Reboots restart the timer interval;
+missed messages are not replayed. Manual `--force` explicitly bypasses that
+guard and should not be used for normal scheduling.
+The configuration helper refuses to overwrite
 existing private files. Additional-recipient templates and optional AI summary
 support are opt-in. For an approved optional AI summary, the following chain
 privately installs the API credential, performs one paid preview, and installs
@@ -405,7 +537,11 @@ after key creation, correct the cause and resume at the preview line, not at
 key creation. Do not enable the drop-in until preview succeeds. This starts no
 extra email or data-processing run. The reporter sends selected sanitised
 observations, not raw logs/data, for an optional interpretation. It falls back
-to measured reports if unavailable and cannot control the server. Its local
+to measured reports if unavailable and cannot control the server. Live API
+observations supplied to AI are restricted to status, validated snapshot dates
+and aggregate counters, not credentials, origin addresses, article contents or
+filesystem paths. The measured API and updater observations remain authoritative;
+AI must not describe an old updater failure as a proven serving outage. Its local
 request-count allowance is not an account-wide spending cap; review code and
 current provider pricing before enabling. API usage costs are separate from
 hosting costs, and the feature is off by default.
@@ -413,3 +549,76 @@ hosting costs, and the feature is off by default.
 Disable future messages with
 `sudo systemctl disable --now ojs-api-progress-email.timer`; this does not stop
 the API or update job. Revoke reporting credentials when no longer needed.
+
+### One processing-start notice, then three-day reports
+
+This optional workflow sends the primary recipient and one existing subscriber
+a notice after a selected snapshot actually starts SQL import, then starts each
+recipient's own 72-hour reporting interval. It **never starts or unpauses a
+build**. Downloading, archive validation, an old failed run and a parent
+supervisor heartbeat do not qualify. The selected snapshot's raw-load message
+and fresh positive SQL-import byte counter must belong to the same process in
+the current updater invocation, after the watcher was armed.
+
+Configure and test the two recipients' email/API access first. In these examples,
+`colleague` is an already-configured subscriber instance, and `2026-11-01` is the
+snapshot to watch. Change both consistently for a different deployment. Install
+the reviewed reporter changes in `/srv/ojs_api` before these commands. Stop the
+old schedules first; do not manually start a reporting service while waiting
+for the processing-start notice:
+
+```bash
+cd /srv/ojs_api
+OJS_NOTICE_SUBSCRIBER=colleague
+OJS_NOTICE_DATE=2026-11-01
+sudo systemctl disable --now ojs-api-progress-email.timer "ojs-api-progress-email@${OJS_NOTICE_SUBSCRIBER}.timer"
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email.service deploy/ojs-api-progress-email.timer deploy/ojs-api-progress-email@.service deploy/ojs-api-progress-email@.timer /etc/systemd/system/
+
+# The privileged watcher must not execute code writable by the application user.
+sudo install -d -o root -g root -m 755 /usr/local/lib/ojs-api-monitor/scripts /usr/local/lib/ojs-api-monitor/src
+sudo install -o root -g root -m 644 scripts/watch_processing_start.py /usr/local/lib/ojs-api-monitor/scripts/
+sudo install -o root -g root -m 644 src/email_progress.py src/progress_activity.py src/progress_api.py src/progress_llm.py src/progress_observations.py src/progress_summary.py src/processing_start_notice.py /usr/local/lib/ojs-api-monitor/src/
+sudo install -o root -g root -m 644 deploy/ojs-api-processing-start@.service deploy/ojs-api-processing-start@.timer /etc/systemd/system/
+```
+
+Create `/etc/ojs-api/processing-start.env` as root-owned mode 600, using
+`deploy/processing-start.env.example` as the template. Set the subscriber instance
+and selected snapshot's marker path. Do not overwrite an existing setup for a
+different snapshot without reviewing its pending notices and delivery receipts.
+This file contains no passwords or API keys. Then install its reporting drop-ins:
+
+```bash
+sudo install -d -o root -g root -m 755 /etc/systemd/system/ojs-api-progress-email.service.d /etc/systemd/system/ojs-api-progress-email@.service.d
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email-start-notice.conf /etc/systemd/system/ojs-api-progress-email.service.d/40-start-notice.conf
+sudo install -o root -g root -m 644 deploy/ojs-api-progress-email-start-notice.conf /etc/systemd/system/ojs-api-progress-email@.service.d/40-start-notice.conf
+sudo systemctl daemon-reload
+sudo python3 /usr/local/lib/ojs-api-monitor/scripts/watch_processing_start.py --snapshot "$OJS_NOTICE_DATE" --recipient primary --recipient "$OJS_NOTICE_SUBSCRIBER" --arm
+sudo systemctl enable --now "ojs-api-processing-start@${OJS_NOTICE_DATE}.timer"
+sudo systemctl list-timers 'ojs-api-processing-start*' 'ojs-api-progress-email*' --all --no-pager
+```
+
+Arming sends no message. The watcher checks once a minute, without SMTP or AI
+credentials. On a genuine start it asks the existing sandboxed report services
+to send, individually. Each report includes the historical start timestamp,
+current API availability and current processing activity. The one-time notice
+can bypass an older report's minimum interval once. A successful notice writes
+the same recipient-specific delivery state used by subsequent 72-hour reports;
+ordinary reports preserve the notice receipt. A failure for one recipient does
+not resend the other recipient's accepted notice.
+
+Pending delivery is retried no more often than every 15 minutes. If SMTP
+acceptance is known but the receipt could not be saved, or an attempt is
+interrupted with ambiguous delivery, that recipient is held for manual review
+instead of repeatedly emailed. SMTP acceptance is not proof of inbox delivery,
+and a network interruption at SMTP acceptance cannot guarantee exactly-once
+delivery. Review Gmail delivery and the journal before resolving a held state;
+do not delete state files to force retries.
+
+The root-owned watcher state and nonsecret marker live under
+`/var/lib/ojs-api-start-notice/`; recipient receipts remain under
+`/var/lib/ojs-api-report/`. Keep these across redeployments and reboots. Review
+status with `sudo journalctl -u 'ojs-api-processing-start@*.service' -n 20 --no-pager`.
+Once both notices are accepted and their reporting timers started, the watcher
+disables its own timer. To cancel while waiting, disable the watcher timer; the two ordinary
+report timers stay disabled until deliberately enabled or their notice is sent.
+These timers do not fix storage, MySQL compatibility, or paused build scheduling.

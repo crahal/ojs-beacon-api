@@ -60,6 +60,8 @@ Production API credentials are loaded at process startup; see
 | `OJS_COMPACT_STORAGE` | `1` | Native compression and bounded intermediate storage |
 | `OJS_METADATA_WORKERS` | `1` | XML metadata workers; leave at one on a 4 GiB host |
 | `OJS_PROGRESS_SECONDS` | `30` | Heartbeat interval; finite 1–3600 seconds |
+| `OJS_BUILD_WORKSPACE_GB` | Unset (builds blocked) | Reviewed **additional** peak working space in GiB for a new candidate, staging/indexes and final export; include growth headroom. Existing data already consumes measured free space. Required before unattended builds, not publication of completed releases |
+| `OJS_BUILD_SCRATCH_GB` | Unset | Additional scratch budget in GiB, required whenever `OJS_MYSQL_TMP_ROOT` is configured. Omit that scratch component from the workspace budget, even when both paths share a filesystem |
 | `OJS_MIN_FREE_GB` | `20` | Minimum starting free space, measured in GiB; not estimated build peak |
 | `OJS_DISK_RESERVE_GB` | `8` | Stop guard while processing, measured in GiB |
 | `OJS_MIN_AVAILABLE_MEMORY_MB` | `512` | Minimum currently available host memory, measured in MiB |
@@ -70,6 +72,32 @@ Production API credentials are loaded at process startup; see
 | `OJS_MAX_ACTIVE_ARTICLE_DROP_FRACTION` | `0.05` | Quarantine unexpectedly large active-article loss |
 | `OJS_MAX_ARTICLE_REMOVAL_FRACTION` | `0.05` | Quarantine unexpectedly large removals |
 | `OJS_MAX_ARTICLE_MERGE_FRACTION` | `0.01` | Quarantine unexpectedly large merges |
+
+The build admission check groups data, raw input and configured scratch by
+filesystem. Each filesystem must accommodate the sum of its working budgets,
+the advertised new download (if needed), and the reserve; available space is
+never pooled between different disks. The minimum start floor is checked too.
+Without a configured `OJS_MYSQL_TMP_ROOT`, include SQL temporary space in
+`OJS_BUILD_WORKSPACE_GB` itself. Budget values must be finite and positive. They are operator-reviewed estimates,
+not automatic predictions or a guarantee that the build will fit. Revisit them
+as the catalogue grows. A large disk that holds the serving database may still
+be too small for a full build beside it.
+
+Admission runs before downloading and again before building. An unchanged,
+already-validated upstream release remains a cheap no-op without a configured
+build budget. Explicit publication/recovery keeps its existing separate guards.
+An interrupted candidate also occupies measured space: do not lower the budget
+merely to make a retry pass; review the actual remaining work.
+
+`make automatic-readiness` performs bounded metadata/lock/configuration checks
+and an upstream HEAD request; it never hashes the large export, downloads data,
+starts MySQL, sends mail, calls an LLM, enables scheduling or removes a pause.
+`ready_for_build` excludes the intentional pause/scheduler state;
+`automatic_updates_allowed` also requires those activation checks. Exit code 3
+means build admission is blocked, while exit 0 may still mean `status=prepared`
+and automatic execution remains disabled. A positive result does not verify
+backups, public API health, duplicate entries in arbitrary user crontabs, or
+the complete effective systemd configuration; operators must review those too.
 
 The service's outer work timeout is 31 days. Graceful database rollback may
 continue beyond either timeout; `TimeoutStopSec=infinity` intentionally avoids
@@ -118,6 +146,43 @@ Progress-email credentials live outside the repository under `/etc/ojs-api`,
 are provided through systemd credentials, and are not required for the API.
 Email/optional AI reporting has separate timers and access permissions. See
 [reporting limitations](OPERATIONS.md#optional-progress-email).
+
+### Optional live-API observations in progress reports
+
+| Setting or file | Meaning |
+| --- | --- |
+| `/etc/ojs-api/progress-api.env` | Root:root mode 600, created by `scripts/configure_progress_api.py`; contains the monitoring origin only, not credentials |
+| `OJS_PROGRESS_API_BASE_URL` | Opt-in public HTTPS origin, with no username, password, path, query or fragment; TLS verification and redirect refusal protect the credential |
+| systemd credential `api-client.env` | Private copy of the existing API username/key provided by `deploy/ojs-api-progress-email-api.conf`; never an environment-variable key or command-line secret |
+
+No API requests are made when this origin is unset. Configure it independently
+of `.env`: the reporting sandbox intentionally cannot read `.env` or `.secrets`.
+The system manager supplies only the selected credential before sandboxing;
+the base service's filesystem and Docker restrictions remain intact. Install
+the drop-in for both the primary report service and the subscriber template
+when those services are in use. No timer or recipient is changed by this opt-in.
+
+Use `scripts/preview_progress_report.sh` for a factual sandboxed preview without
+mail, AI calls or state writes. API credential failure, a network/TLS error, an
+unconfigured probe and a failed update job are separate observations; none
+alone proves that the serving database was lost. Observations are made from the
+VM, not an external uptime provider. See the
+[activation instructions](OPERATIONS.md#observe-the-live-api).
+
+### Reporting cadence and processing-start notices
+
+Both the primary and subscriber reporters default to a 72-hour minimum between
+accepted messages. Their systemd timers use 72 hours after service completion;
+reboots delay the next send rather than replaying a backlog. Each recipient has
+independent durable state and shares the reporting/AI-budget lock.
+
+The opt-in `OJS_PROGRESS_START_NOTICE_FILE` points to a bounded root-owned JSON
+marker generated by the processing-start watcher, never by a download. Configure
+it through `/etc/ojs-api/processing-start.env`, not the application's `.env`.
+`OJS_PROGRESS_START_SUBSCRIBER` selects an existing subscriber instance name,
+not an email address. No new credential or paid cloud service is required.
+See [the processing-start workflow](OPERATIONS.md#one-processing-start-notice-then-three-day-reports)
+for installation, arming, receipt retention and failed-delivery handling.
 
 ## Validate changes safely
 
