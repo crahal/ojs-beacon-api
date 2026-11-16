@@ -24,6 +24,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Trust only this container-mounted checkout
+        # The runner owns the bind mount; the container uses a different UID.
+        # Checkout's temporary Git configuration does not persist to run steps.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install pinned dependencies
         run: python -m pip install -r requirements.txt
       - name: Check shareable source
