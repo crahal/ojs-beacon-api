@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Improve tester-access navigation and maintenance guidance: distinguish working
+  files from unpushed commits, explain permission-only changes, and document
+  native tester-authentication outages separately from invalid credentials.
 - Consolidate maintained source and contribution instructions under
   `ojs-beacon-api`; preserve existing runtime paths and service names. Repository
   consolidation does not deploy code or alter running processing.
