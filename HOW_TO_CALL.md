@@ -294,13 +294,18 @@ Avoid parallel full-catalogue scans or repeatedly downloading XML unnecessarily.
 | `401` | Check Basic username/key; do not retry indefinitely. |
 | `404` | Unknown article or route. A retained removed/merged article normally returns its tombstone, not 404. |
 | `422` | Correct invalid REST dates, status, ISSN, IDs, or pagination parameters. |
-| `503` | Service unavailable, concurrency limit reached, or no published snapshot; retry later. |
+| `503` | Service unavailable, concurrency limit reached, or no published snapshot; retry later and report persistent failures. |
 | Other `5xx`, timeouts, connection failures | Retry idempotent GET requests with bounded exponential backoff and jitter. |
 
 For example, wait roughly 2, 4, 8, 16, then 30 seconds, with small random jitter;
 stop after a bounded number of attempts and alert rather than hammering the
 server. Honor `Retry-After` if an upstream proxy supplies it. Never advance a
 cursor on an unsuccessful or unparsed response.
+
+In [native tester-access mode](docs/TESTER_ACCESS.md), an unavailable configured
+authentication registry also produces `503` for tester requests. `/health` and
+the internal monitoring account can still work, so a healthy status check does
+not rule out an access problem. Report persistent failures to the operator.
 
 When reporting an issue, share the endpoint, non-secret parameters, UTC time,
 HTTP status, and `/meta` snapshot date if available. Do not share the key,

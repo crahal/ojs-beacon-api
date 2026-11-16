@@ -19,6 +19,7 @@ empty MySQL container does not create a usable catalogue.
 | --- | --- |
 | Deploy a fresh server | [Deployment overview](HOW_TO_DEPLOY.md), then [Lightsail setup](LIGHTSAIL_DEPLOYMENT.md) |
 | Query or harvest the API | [API guide](HOW_TO_CALL.md) |
+| Issue, activate or revoke tester access | [Tester access](docs/TESTER_ACCESS.md) |
 | Understand processing and deduplication | [Processing guide](PROCESSING_GUIDE.md) |
 | Monitor, update, back up and recover | [Operations](docs/OPERATIONS.md) |
 | Choose settings and resource limits | [Configuration](docs/CONFIGURATION.md) |
@@ -26,6 +27,7 @@ empty MySQL container does not create a usable catalogue.
 | Transfer and publish completed history | [Release handoff](docs/API_HISTORY_HANDOFF.md) |
 | Review a storage migration | [Storage migration](docs/LIGHTSAIL_512_STORAGE.md) |
 | Contribute or report a security concern | [Contributing](CONTRIBUTING.md), [security](SECURITY.md) |
+| Understand local changes and unpushed commits | [Repository status](CONTRIBUTING.md#check-repository-status) |
 | Share a privacy-checked source snapshot | [Sharing checklist](docs/SHARING.md) |
 
 ## How it works

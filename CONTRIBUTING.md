@@ -46,6 +46,46 @@ and installation directory `/srv/ojs_api` intentionally stay unchanged. Do not
 update application files underneath an active build; use the reviewed
 [upgrade workflow](docs/OPERATIONS.md#application-and-dependency-upgrades).
 
+## Check repository status
+
+Run these commands in the intended working clone, not in a backup or temporary
+review checkout:
+
+```bash
+git remote get-url origin
+git status --short --branch
+git diff --stat
+git diff --summary
+git diff --cached --stat
+```
+
+The maintained remote is `https://github.com/crahal/ojs-beacon-api.git`.
+In short status, the first column shows staged changes, the second shows
+unstaged changes, and `??` marks untracked files. These are file changes, not
+unpushed commits. `git diff --summary` identifies executable-permission changes
+that can appear even when file contents are identical. Restore intended
+permissions after review; do not hide them by disabling Git's file-mode checks.
+
+For a branch with an upstream configured, refresh the remote references and
+compare commits:
+
+```bash
+git fetch origin
+git rev-list --left-right --count 'HEAD...@{upstream}'
+```
+
+The first count is local-only commits; the second is upstream-only commits.
+`0 0` means the branch histories match, but does not mean the working files are
+clean. Counts before a fetch reflect the last observed remote state. A new
+branch without an upstream cannot use this comparison yet.
+
+If an editor disagrees with these commands, check its selected repository and
+refresh Source Control. Close temporary review checkouts in the editor; reload
+the window if necessary. Do not delete files, force-add ignored data or reset
+work to make an editor badge disappear. Git status and synchronization are
+separate from API availability and processing progress; fetching or committing
+source does not deploy it.
+
 ## Local checks
 
 Use Python 3.12 in an isolated environment:
