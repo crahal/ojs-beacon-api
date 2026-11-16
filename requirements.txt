@@ -1,5 +1,5 @@
 # Runtime dependency set tested on Python 3.12. Update together and rerun tests.
-fastapi==0.136.0
+fastapi==0.162.5
 uvicorn==0.37.0
 PyMySQL[rsa]==1.2.4
 annotated-doc==0.0.6
