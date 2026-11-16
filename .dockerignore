@@ -15,3 +15,5 @@ src/*/**
 **/*.log
 **/.env*
 **/.secrets/
+# Explicit defense in depth for workstation-only notes and invitation drafts.
+**/.local/

@@ -33,7 +33,10 @@ import download_beacon
 import publish_live
 import run_pipeline
 from build_baseline import assert_automatic_baseline
-from build_budget import build_budget, existing_lock_busy
+from build_budget import build_budget, existing_lock_busy, scratch_reserve_gib
+from export_handoff import (validate_retired_baseline, validate_resume_handoff,
+                            document_sha256, retirement_receipt_path,
+                            read_checkpoint_document, successor_export_reuse_metadata)
 from mount_safety import assert_cleanup_unmounted
 from progress_logging import Progress, progress_interval
 from source_activity import SourceActivityBusy, source_activity, source_activity_child_options
@@ -150,7 +153,8 @@ class Release:
     report: dict
 
 
-def validate_release(clean: Path, date: str, *, require_directory: bool = True) -> Release:
+def validate_release(clean: Path, date: str, *, require_directory: bool = True,
+                     retired_successor: str | None = None) -> Release:
     if not re.fullmatch(DATE, date):
         raise UpdateError("invalid release date")
     export = safe_child(clean, f"pkpbeacon-clean-{date}.sql.gz")
@@ -159,12 +163,20 @@ def validate_release(clean: Path, date: str, *, require_directory: bool = True) 
         path = safe_child(clean, name)
         if not path.is_file():
             raise UpdateError(f"incomplete release: {path}")
-    with Progress("update-release-checksums", disk_path=clean,
-                  step="clean-export") as progress:
-        checksum = publish_live.checksum_for(export)
-        publish_live.verify_export_checksum(export, checksum)
-        progress.event("export-verified", step="release-provenance")
-        source_hash, build_hash = publish_live.candidate_provenance(export, date, checksum)
+    if not export.exists() and retired_successor is not None:
+        # This exception is for OLD-artifact cleanup only. A candidate being
+        # published must always possess its real checksum-verified export.
+        validate_retired_baseline(clean, date, retired_successor)
+        authenticated_report = read_json(clean / f"pkpbeacon-changes-{date}.json")
+        source_hash = authenticated_report["snapshot"]["source_sha256"]
+        build_hash = authenticated_report["snapshot"]["build_sql_sha256"]
+    else:
+        with Progress("update-release-checksums", disk_path=clean,
+                      step="clean-export") as progress:
+            checksum = publish_live.checksum_for(export)
+            publish_live.verify_export_checksum(export, checksum)
+            progress.event("export-verified", step="release-provenance")
+            source_hash, build_hash = publish_live.candidate_provenance(export, date, checksum)
     report = read_json(clean / f"pkpbeacon-changes-{date}.json")
     if report.get("release_guard", {}).get("status") not in ("passed", "overridden"):
         raise UpdateError(f"release guard has not passed for {date}")
@@ -257,6 +269,10 @@ class Coordinator:
             if directory.is_symlink():
                 raise UpdateError(f"refusing symlinked data directory: {directory}")
         self.env = os.environ.copy()
+        # The parent and pipeline must enforce the same selected reserve,
+        # including an explicit command-line override of the environment.
+        if hasattr(args, "reserve_gb"):
+            self.env["OJS_DISK_RESERVE_GB"] = str(args.reserve_gb)
         self.runner = runner or Runner()
         self.journal = self.clean / ".compact-update.json"
         self.deadline = time.monotonic() + args.max_runtime_hours * 3600
@@ -265,7 +281,7 @@ class Coordinator:
     def command(self, command, *, env=None, timeout=180):
         return self.runner.run(command, cwd=self.root, env=env or self.env, timeout=timeout)
 
-    def capacity(self, minimum: float) -> None:
+    def capacity(self, minimum: float, *, separate_scratch_reserve: bool = False) -> None:
         path = self.clean if self.clean.exists() else self.root
         paths = [("data", path)]
         if self.raw.exists() and self.raw.stat().st_dev != path.stat().st_dev:
@@ -275,11 +291,20 @@ class Coordinator:
         )
         if scratch is not None:
             paths.append(("MySQL scratch", scratch))
+        # Never let a smaller scratch reserve weaken the data reserve when
+        # both directories are on the same filesystem.
+        data_devices = {directory.stat().st_dev for label, directory in paths
+                        if label != "MySQL scratch"}
         for label, directory in paths:
+            required = minimum
+            if separate_scratch_reserve and label == "MySQL scratch":
+                required = scratch_reserve_gib(self.env, minimum)
+                if directory.stat().st_dev in data_devices:
+                    required = max(required, minimum)
             free = shutil.disk_usage(directory).free
-            if free < minimum * GIB:
+            if free < required * GIB:
                 raise UpdateError(f"disk reserve reached on {label}: {free / GIB:.1f} GiB free; "
-                                  f"{minimum:g} GiB required; existing database files retained")
+                                  f"{required:g} GiB required; existing database files retained")
 
     def memory_capacity(self) -> None:
         minimum_mb = int(self.env.get("OJS_MIN_AVAILABLE_MEMORY_MB", "512"))
@@ -308,12 +333,201 @@ class Coordinator:
             raise UpdateError("automatic build not admitted: " + ", ".join(report["blockers"]) +
                               "; review the working-space budget; live database retained")
 
+    def export_resume_capacity(self, version: str) -> dict:
+        """Read-only export admission; reclamation remains conditional on validation."""
+        live = live_directory(self.clean)
+        if live is None:
+            raise UpdateError("export recovery has no verified rollback catalogue")
+        state = validate_resume_handoff(self.clean, version, live.name[6:])
+        configuration_blockers = []
+        try:
+            if not run_pipeline.retirement_enabled(self.env):
+                configuration_blockers.append("export_retirement_not_enabled")
+            if not run_pipeline.deferred_payload_enabled(self.env):
+                configuration_blockers.append("export_deferred_payload_not_enabled")
+            page_kb = run_pipeline.compression_page_kb(self.env)
+            events = run_pipeline.event_history_enabled(self.env)
+            expected_profiles = {
+                "storage_layout_profile": run_pipeline.layout_profile(page_kb) if page_kb != 8 else None,
+                "event_history_profile": run_pipeline.event_layout_profile(page_kb) if events else None,
+            }
+            if any(state.get(key) != value for key, value in expected_profiles.items()):
+                configuration_blockers.append("export_storage_profile_mismatch")
+        except ValueError:
+            configuration_blockers.append("export_recovery_configuration_invalid")
+        baseline = state["export_handoff"]["baseline"]
+        export = safe_child(self.clean, baseline["export_filename"])
+        credit = baseline["export_size_bytes"] if export.exists() else 0
+        env = dict(self.env, OJS_BUILD_WORKSPACE_GB=self.env.get("OJS_BUILD_EXPORT_GB", ""))
+        scratch = run_pipeline.mysql_scratch_root(configured=self.env.get("OJS_MYSQL_TMP_ROOT", ""))
+        report = build_budget(clean=self.clean, raw=self.raw, scratch=scratch, env=env,
+                              needs_download=False, remote_size=None,
+                              reserve_gib=self.args.reserve_gb, minimum_gib=self.args.min_free_gb)
+        reuse = successor_export_reuse_metadata(self.clean, state)
+        export_budget_valid = not any(code.startswith("build_workspace_gb_") for code in report["blockers"])
+        export_working_bytes = (math.ceil(float(env["OJS_BUILD_WORKSPACE_GB"]) * GIB)
+                                if export_budget_valid else 0)
+        for group in report["filesystems"]:
+            if "data" not in group["roles"]:
+                continue
+            if reuse is not None and export_budget_valid:
+                # Metadata supplies conditional admission only. The runner
+                # authenticates every gzip byte before waiving this allocation.
+                group["conditional_export_reuse_bytes"] = export_working_bytes
+                group["working_bytes"] -= export_working_bytes
+                group["required_free_bytes"] = max(
+                    math.ceil(self.args.min_free_gb * GIB),
+                    group["working_bytes"] + group["download_bytes"] + group["reserve_bytes"])
+            group["conditional_retirement_bytes"] = credit
+            group["available_after_retirement_bytes"] = group["available_bytes"] + credit
+            group["enough_space"] = group["available_after_retirement_bytes"] >= group["required_free_bytes"]
+            blocker = "insufficient_" + "_".join(group["roles"]) + "_space"
+            if group["enough_space"] and blocker in report["blockers"]:
+                report["blockers"].remove(blocker)
+        report["blockers"].extend(configuration_blockers)
+        report["approved"] = not report["blockers"]
+        report["resume_phase"] = "export_ready"
+        report["conditional_successor_export_reuse"] = reuse is not None
+        report["note"] = ("Retirement and successor reuse credits are conditional; the runner revalidates "
+                          "the database, fully hashes any reused export, and checks actual free space before exporting.")
+        return report
+
     def incomplete_builds(self) -> None:
         for staging in self.clean.glob("mysql-????-??-??.building"):
             safe_child(self.clean, staging.name)
             state = run_pipeline.read_build_state(staging)
+            if state is not None and state.get("phase") == "export_ready":
+                live = live_directory(self.clean)
+                if live is None:
+                    raise UpdateError("export recovery has no verified rollback catalogue")
+                validate_resume_handoff(self.clean, staging.name[6:-9], live.name[6:])
+                continue
             if state is None or state.get("phase") != "metadata_ready":
                 raise UpdateError("incomplete build requires manual recovery; candidate retained; no download started")
+
+    def export_resume(self) -> str | None:
+        """Select one validated export checkpoint before any upstream download."""
+        candidates = []
+        for staging in self.clean.glob("mysql-????-??-??*"):
+            match = re.fullmatch(rf"mysql-({DATE})(\.building)?", staging.name)
+            if match is None:
+                continue
+            safe_child(self.clean, staging.name)
+            if (run_pipeline.read_build_state(staging) or {}).get("phase") != "export_ready":
+                continue
+            version = match.group(1)
+            if not match.group(2) and run_pipeline.release_artifacts_complete(self.clean, version):
+                continue
+            candidates.append(version)
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise UpdateError("multiple export checkpoints require operator review; nothing downloaded")
+        live = live_directory(self.clean)
+        if live is None:
+            raise UpdateError("export recovery has no verified rollback catalogue")
+        validate_resume_handoff(self.clean, candidates[0], live.name[6:])
+        return candidates[0]
+
+    def completed_handoff_version(self) -> str | None:
+        """Identify a committed, receipt-bound successor without reading its gzip.
+
+        A crash can leave either the durable checkpoint or only the completed
+        release before mysql-current/publication have caught up. The receipt
+        permits only the exact successor of the current live predecessor.
+        Full export and cold database checks still precede promotion.
+        """
+        live = live_directory(self.clean)
+        if live is None:
+            return None
+        predecessor = live.name[6:]
+        receipt_path = retirement_receipt_path(self.clean, predecessor)
+        safe_child(self.clean, receipt_path.name)
+        if not receipt_path.exists():
+            return None
+        receipt = validate_retired_baseline(self.clean, predecessor)
+        version = receipt["successor"]["snapshot_date"]
+        candidate = safe_child(self.clean, f"mysql-{version}")
+        if not candidate.is_dir() or not run_pipeline.release_artifacts_complete(self.clean, version):
+            return None
+        newer = []
+        for path in self.clean.glob("mysql-????-??-??*"):
+            match = re.fullmatch(rf"mysql-({DATE})(\.building)?", path.name)
+            if match is not None and match.group(1) > predecessor:
+                safe_child(self.clean, path.name)
+                newer.append(path)
+        if newer != [candidate]:
+            raise UpdateError("completed handoff has competing candidates; publication requires review")
+        assert_automatic_baseline(self.clean, candidate)
+        report = read_checkpoint_document(self.clean / f"pkpbeacon-changes-{version}.json")
+        snapshot = report["snapshot"]
+        expected = {"snapshot_date": version,
+                    "source_sha256": snapshot["source_sha256"],
+                    "build_sql_sha256": snapshot["build_sql_sha256"],
+                    "report_sha256": document_sha256(report)}
+        if (snapshot.get("previous_snapshot_date") != predecessor
+                or receipt["successor"] != expected):
+            raise UpdateError("completed handoff is not bound to the live predecessor and published report")
+        checkpoint = run_pipeline.build_state_path(candidate)
+        if checkpoint.exists() or checkpoint.is_symlink():
+            state = validate_resume_handoff(self.clean, version, predecessor)
+            if state["export_handoff"]["report"] != report:
+                raise UpdateError("completed handoff checkpoint and published report disagree")
+        if live_directory(self.clean) != live:
+            raise UpdateError("live predecessor changed during completed handoff validation")
+        return version
+
+    def build_or_resume(self) -> dict | None:
+        ready = self.export_resume()
+        if ready is not None:
+            # No HEAD/download or metadata/temporal replay. The runner cold-
+            # verifies this complete candidate, then enforces its separate
+            # export budget after any authorized predecessor retirement.
+            matches = [safe_child(self.raw, f"pkpbeacon-{ready}{suffix}")
+                       for suffix in (".sql.gz", ".sql")
+                       if (self.raw / f"pkpbeacon-{ready}{suffix}").exists()]
+            if len(matches) != 1:
+                raise UpdateError("export recovery requires exactly one retained source archive")
+            self.compatible_mysql_tools()
+            self.capacity(self.args.reserve_gb, separate_scratch_reserve=True)
+            self.memory_capacity()
+            budget = self.export_resume_capacity(ready)
+            if not budget["approved"]:
+                raise UpdateError("export recovery is not admitted by its export/scratch budgets; candidate retained")
+            self.guard_build_directories()
+            self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
+                        "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
+                        "--snapshot", str(matches[0]), "--skip-download",
+                        "--resume-building", "--compact-storage"],
+                       stage="update-export-resume")
+            return None
+        probe = self.probe()
+        current = live_directory(self.clean)
+        known = probe.get("known_snapshot")
+        known_name = Path(known).name if isinstance(known, str) else ""
+        known_match = re.fullmatch(rf"pkpbeacon-({DATE})\.sql\.gz", known_name)
+        if not probe["needs_download"] and current is not None and known_match and current.name == f"mysql-{known_match.group(1)}":
+            metadata = download_beacon.read_validated_metadata(safe_child(self.raw, known_name))
+            marker = read_json(current / MARKER)
+            if metadata and metadata.get("uncompressed_sha256") == marker.get("source_sha256"):
+                return {"status": "unchanged", "release": known_match.group(1)}
+        self.compatible_mysql_tools()
+        self.capacity(self.args.min_free_gb)
+        self.memory_capacity()
+        assert_automatic_baseline(self.clean, current)
+        self.require_build_capacity(probe)
+        self.guard_build_directories()
+        if probe["needs_download"]:
+            self.child(self.download_command(), stage="update-download")
+        # Downloads may take hours; repeat the baseline and capacity checks.
+        assert_automatic_baseline(self.clean, current)
+        self.require_build_capacity(probe, downloaded=True)
+        self.guard_build_directories()
+        self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
+                    "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
+                    "--skip-download", "--resume-building", "--compact-storage"],
+                   stage="update-build")
+        return None
 
     def scheduler_status(self) -> dict:
         """Small allowlisted systemd observations; never read unit environments."""
@@ -377,10 +591,21 @@ class Coordinator:
                                     (self.root / "data" / PAUSE_MARKER).is_symlink(),
                   "recovery_pending": self.journal.exists() or self.journal.is_symlink()}
         live = None
+        ready = None
+        publication_ready = None
         try:
             live = live_directory(self.clean)
             report["live_snapshot"] = live.name.removeprefix("mysql-") if live else None
-            report["baseline_snapshot"] = assert_automatic_baseline(self.clean, live)
+            publication_ready = self.completed_handoff_version()
+            ready = None if publication_ready else self.export_resume()
+            if publication_ready is not None:
+                report["baseline_snapshot"] = report["live_snapshot"]
+                report["resume_phase"] = "publication_ready"
+            elif ready is not None:
+                report["baseline_snapshot"] = report["live_snapshot"]
+                report["resume_phase"] = "export_ready"
+            else:
+                report["baseline_snapshot"] = assert_automatic_baseline(self.clean, live)
         except (OSError, RuntimeError, ValueError):
             blockers.append("history_baseline_unavailable")
         if report["recovery_pending"]:
@@ -410,11 +635,23 @@ class Coordinator:
         if not self.env.get("MYSQL_ROOT_PASSWORD"):
             blockers.append("database_credentials_unset")
         try:
-            probe = self.probe()
-            report["source"] = {"needs_download": probe["needs_download"],
-                                "date_hint": probe.get("date_hint"),
-                                "compressed_bytes": probe.get("remote", {}).get("size")}
-            report["capacity"] = self.build_capacity(probe)
+            if publication_ready is not None:
+                self.capacity(self.args.reserve_gb, separate_scratch_reserve=True)
+                report["source"] = {"needs_download": False, "date_hint": publication_ready,
+                                    "reason": "publish_completed_export_handoff"}
+                report["capacity"] = {"approved": True, "blockers": [],
+                                      "resume_phase": "publication_ready",
+                                      "reserve_bytes": math.ceil(self.args.reserve_gb * GIB)}
+            elif ready is not None:
+                report["source"] = {"needs_download": False, "date_hint": ready,
+                                    "reason": "resume_retained_export_checkpoint"}
+                report["capacity"] = self.export_resume_capacity(ready)
+            else:
+                probe = self.probe()
+                report["source"] = {"needs_download": probe["needs_download"],
+                                    "date_hint": probe.get("date_hint"),
+                                    "compressed_bytes": probe.get("remote", {}).get("size")}
+                report["capacity"] = self.build_capacity(probe)
             blockers.extend(report["capacity"]["blockers"])
         except (OSError, RuntimeError, ValueError, TypeError):
             blockers.append("source_or_capacity_check_unavailable")
@@ -456,7 +693,7 @@ class Coordinator:
         with Progress(stage, disk_path=self.clean, step="supervise-child"):
             self.runner.child(command, cwd=self.root,
                               **source_activity_child_options(self.raw, self.env),
-                              reserve_check=lambda: self.capacity(self.args.reserve_gb),
+                              reserve_check=lambda: self.capacity(self.args.reserve_gb, separate_scratch_reserve=True),
                               timeout=remaining)
 
     def download_command(self) -> list[str]:
@@ -706,7 +943,7 @@ class Coordinator:
             return
         if previous and previous.name > release.datadir.name:
             raise UpdateError("refusing to replace live database with an older release")
-        self.capacity(self.args.reserve_gb)
+        self.capacity(self.args.reserve_gb, separate_scratch_reserve=True)
         self.credentials()  # Fail before stopping services if the health check cannot authenticate.
         with Progress("update-cold-verification", disk_path=self.clean):
             self.verify_database(release)
@@ -735,17 +972,30 @@ class Coordinator:
             if date >= current.date:
                 continue
             try:
-                old = validate_release(self.clean, date, require_directory=False)
+                old = validate_release(self.clean, date, require_directory=False,
+                                       retired_successor=current.date)
+                if not old.export.exists():
+                    receipt = validate_retired_baseline(self.clean, date, current.date)
+                    expected_successor = {"snapshot_date": current.date,
+                                          "source_sha256": current.source_sha256,
+                                          "build_sql_sha256": current.build_sql_sha256,
+                                          "report_sha256": document_sha256(current.report)}
+                    if receipt["successor"] != expected_successor:
+                        raise UpdateError("retirement receipt is not bound to the published successor")
                 paths = []
                 if old.datadir.exists():
-                    validate_release(self.clean, date)
+                    validate_release(self.clean, date, retired_successor=current.date)
                     paths.append(old.datadir)
                 raw = safe_child(self.raw, f"pkpbeacon-{date}.sql.gz")
                 if raw.exists():
                     metadata = download_beacon.read_validated_metadata(raw)
                     if metadata and metadata.get("source_url") == self.args.url and metadata.get("uncompressed_sha256") == old.source_sha256:
                         paths.extend((raw, safe_child(self.raw, raw.name + ".metadata.json")))
-                paths.extend((old.export, old.export.with_name(old.export.name + ".sha256")))
+                # Early retirement removes only the old gzip; its checksum,
+                # report, manifest and receipt authenticate normal later cleanup.
+                if old.export.exists():
+                    paths.append(old.export)
+                paths.append(old.export.with_name(old.export.name + ".sha256"))
                 for path in paths:
                     self.require_unmounted(path)
                     assert_cleanup_unmounted(path)
@@ -870,37 +1120,20 @@ class Coordinator:
                 return {"status": "paused", "reason": "operator_pause", "marker": str(paused)}
             with run_pipeline.pipeline_lock(self.clean), publish_live.publisher_lock(self.root):
                 self.recover()
+                if not self.args.publish_only:
+                    committed = self.completed_handoff_version()
+                    if committed is not None:
+                        release = validate_release(self.clean, committed)
+                        run_pipeline.repair_current_release_pointers(self.clean, committed)
+                        self.promote(release)
+                        return {"status": "published", "release": release.date}
             if not self.args.publish_only:
                 # Refuse a failed finalization BEFORE even a new download. Only
                 # an explicit, audited recovery or rebuild may dispose of work.
                 self.incomplete_builds()
-                probe = self.probe()
-                current = live_directory(self.clean)
-                known = probe.get("known_snapshot")
-                known_name = Path(known).name if isinstance(known, str) else ""
-                known_match = re.fullmatch(rf"pkpbeacon-({DATE})\.sql\.gz", known_name)
-                if not probe["needs_download"] and current is not None and known_match and current.name == f"mysql-{known_match.group(1)}":
-                    metadata = download_beacon.read_validated_metadata(safe_child(self.raw, known_name))
-                    marker = read_json(current / MARKER)
-                    if metadata and metadata.get("uncompressed_sha256") == marker.get("source_sha256"):
-                        return {"status": "unchanged", "release": known_match.group(1)}
-                self.compatible_mysql_tools()
-                self.capacity(self.args.min_free_gb)
-                self.memory_capacity()
-                assert_automatic_baseline(self.clean, current)
-                self.require_build_capacity(probe)
-                self.guard_build_directories()
-                if probe["needs_download"]:
-                    self.child(self.download_command(), stage="update-download")
-                # Downloads may take hours; do not rely on the earlier budget
-                # or silently bootstrap if a baseline disappeared meanwhile.
-                assert_automatic_baseline(self.clean, current)
-                self.require_build_capacity(probe, downloaded=True)
-                self.guard_build_directories()
-                self.child([sys.executable, str(self.root / "src" / "run_pipeline.py"),
-                            "--raw-dir", str(self.raw), "--clean-dir", str(self.clean),
-                            "--skip-download", "--resume-building", "--compact-storage"],
-                           stage="update-build")
+                outcome = self.build_or_resume()
+                if outcome is not None:
+                    return outcome
                 # Builds can last days; recheck after possible host package changes.
                 self._compatible_tools = None
             with run_pipeline.pipeline_lock(self.clean), publish_live.publisher_lock(self.root):

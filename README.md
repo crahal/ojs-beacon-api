@@ -5,7 +5,8 @@ bibliometric catalogue, with an authenticated, read-only REST and OAI-PMH API.
 The latest catalogue carries stable article identifiers, source provenance,
 snapshot summaries and a cumulative change feed.
 
-Canonical source: [crahal/ojs-beacon-api](https://github.com/crahal/ojs-beacon-api).
+The single maintained source repository is
+[crahal/ojs-beacon-api](https://github.com/crahal/ojs-beacon-api).
 
 This repository contains **code, configuration templates and documentation
 only**. It does not include datasets, credentials, a prebuilt database or a
@@ -48,6 +49,11 @@ that every duplicate is found. Published merges are not automatically split.
 
 ## Deployment model
 
+The Docker service/container name `ojs-api` and installation directory
+`/srv/ojs_api` intentionally remain unchanged. They are runtime names, not
+separate maintained repositories. Pushing source changes does not deploy them;
+application upgrades follow the reviewed [operations workflow](docs/OPERATIONS.md#application-and-dependency-upgrades).
+
 The reference deployment uses Ubuntu 24.04, Python 3.12, matching MySQL 8.4.11
 builder/serving tools, Docker Compose and a TLS reverse proxy. A 4 GiB host is
 the resource-limited serving target; a larger workstation can do the expensive
@@ -78,10 +84,12 @@ database connectivity, not the existence of a complete published catalogue;
 deployment acceptance also checks authenticated metadata, snapshots and changes.
 See [security boundaries and limitations](SECURITY.md).
 
-Public examples use documentation-only addresses and domains. Do not publish
-operator notes, raw logs, `.env`, `.secrets`, data directories or the original
-Git history without review. The repository checker is a useful guard, **not a
-complete secret scanner or security certification**.
+Public examples use documentation-only addresses and domains. Ignored private
+files stay local: do not publish operator notes, invitations, raw logs, `.env`,
+`.secrets` or data directories. Legacy operational Git history is not merged
+into the public repository; any retained historical backup is private archival
+material, not an active development repository. The repository checker is a
+useful guard, **not a complete secret scanner or security certification**.
 
 ## Development
 
@@ -104,9 +112,10 @@ shipping pipeline changes. CI runs the portable suite, checks known dependency
 advisories and builds the API image;
 it does not download Beacon data or deploy to AWS.
 
-Start contributions from this canonical clone. Do not push or mirror a private
-operational checkout's history into it; bring over only reviewed code changes
-and follow [the contribution workflow](CONTRIBUTING.md).
+Develop on branches of the canonical repository. Do not push or mirror legacy
+operational history into it; bring over only reviewed source changes and follow
+[the contribution workflow](CONTRIBUTING.md). Code-only exports are for review or
+offline handoff, not a second maintained repository.
 
 ## License and data rights
 

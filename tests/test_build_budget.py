@@ -138,6 +138,37 @@ class BuildBudgetTests(unittest.TestCase):
         self.assertIn("insufficient_data_raw_space", report["blockers"])
         self.assertTrue(report["filesystems"][1]["enough_space"])
 
+    def test_dedicated_scratch_reserve_does_not_reduce_data_reserve(self):
+        self.env["OJS_SCRATCH_RESERVE_GB"] = "8"
+        report = self.budget(reserve_gib=32)
+        data, scratch = report["filesystems"]
+        self.assertEqual(data["reserve_bytes"], 32 * GIB)
+        self.assertEqual(scratch["reserve_bytes"], 8 * GIB)
+        self.assertEqual(scratch["required_free_bytes"], 48 * GIB)
+
+    def test_shared_scratch_uses_larger_reserve_in_both_directions(self):
+        self.scratch.stat.return_value.st_dev = 1
+        for override in ("8", "64"):
+            with self.subTest(override=override):
+                self.env["OJS_SCRATCH_RESERVE_GB"] = override
+                report = self.budget(reserve_gib=32)
+                self.assertEqual(len(report["filesystems"]), 1)
+                self.assertEqual(report["filesystems"][0]["reserve_bytes"],
+                                 max(32, int(override)) * GIB)
+
+    def test_invalid_scratch_reserve_fails_closed(self):
+        for override in ("no", "-1", "nan", "inf", "1e300", str(2**33)):
+            with self.subTest(override=override):
+                self.env["OJS_SCRATCH_RESERVE_GB"] = override
+                with self.assertRaisesRegex(ValueError, "invalid scratch"):
+                    self.budget()
+
+    def test_blank_scratch_reserve_inherits_and_fraction_rounds_up(self):
+        self.env["OJS_SCRATCH_RESERVE_GB"] = "  "
+        self.assertEqual(self.budget()["filesystems"][1]["reserve_bytes"], 20 * GIB)
+        self.env["OJS_SCRATCH_RESERVE_GB"] = "0.0000000001"
+        self.assertEqual(self.budget()["filesystems"][1]["reserve_bytes"], 1)
+
     def test_separate_raw_filesystem_bears_download_plus_its_own_reserve(self):
         self.raw.stat.return_value.st_dev = 3
         self.free[self.raw] = 49 * GIB

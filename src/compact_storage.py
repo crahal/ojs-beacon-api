@@ -127,6 +127,12 @@ _CANONICAL_FALLBACK_END = (
     "WHERE staged.source_record_id IS NULL;\n"
 )
 _SOURCE_RELEASE = "DROP TABLE ojs_stage_sources;\n"
+_DEFERRED_BASELINE_TABLE = "ojs_pipeline_deferred_payload"
+_DEFERRED_BASELINE_REPLACED = """DELETE retained
+FROM ojs_pipeline_deferred_payload retained
+INNER JOIN ojs_stage_canonical_payload payload
+    ON payload.article_id = retained.article_id;
+"""
 _RAW_RELEASE = """SELECT 'OJS_PROGRESS_V1', 'stage', 'raw_storage_release';
 CREATE TABLE ojs_pipeline_raw_stats (
     id TINYINT UNSIGNED NOT NULL,
@@ -348,16 +354,53 @@ def _reclaim_raw_records(sql: str) -> str:
     return before + _RAW_RELEASE + _SOURCE_RELEASE + after
 
 
-def render_compact_sql(sql: str) -> str:
+def _exclude_refreshed_baseline_payload(sql: str) -> str:
+    """Keep only baseline rows whose deferred payload still needs restoration.
+
+    The caller creates the private article-ID tracking table after importing
+    baseline history with payload-only fields omitted. Each canonical payload
+    insertion owns the replacement payload, including legitimate NULL values;
+    those IDs must not later be hydrated from stale baseline metadata. The
+    table deliberately survives stage_cleanup for the caller's final hydrate.
+    """
+    if re.search(rf"\b{_DEFERRED_BASELINE_TABLE}\b", sql, re.IGNORECASE):
+        raise CompactStorageError("deferred baseline payload found existing tracking-table consumers")
+    insertion = "INSERT INTO ojs_stage_canonical_payload\nSELECT\n"
+    starts = [match.start() for match in re.finditer(re.escape(insertion), sql)]
+    if len(starts) != 2:
+        raise CompactStorageError("deferred baseline payload requires both canonical inserts")
+    first_end = "INNER JOIN records r\n    ON r.id = staged.source_record_id;\n"
+    for anchor, description in (
+        (first_end, "staged canonical completion"),
+        (_CANONICAL_FALLBACK_END, "fallback canonical completion"),
+        (_progress_anchor("article_state"), "article state"),
+        (_progress_anchor("stage_cleanup"), "stage cleanup"),
+    ):
+        _require_once(sql, anchor, f"deferred baseline payload {description}")
+    if not (starts[0] < sql.index(first_end) < starts[1]
+            < sql.index(_CANONICAL_FALLBACK_END)
+            < sql.index(_progress_anchor("article_state"))
+            < sql.index(_progress_anchor("stage_cleanup"))):
+        raise CompactStorageError("deferred baseline payload canonical phases are out of order")
+    for anchor in (first_end, _CANONICAL_FALLBACK_END):
+        sql = sql.replace(anchor, anchor + "\n" + _DEFERRED_BASELINE_REPLACED, 1)
+    return sql
+
+
+def render_compact_sql(sql: str, *, deferred_baseline_payload: bool = False) -> str:
     """Defer staged payload and reclaim finished work, rejecting unsupported SQL.
 
     This does not change the source file, persistent table definitions, metadata
     hashes, matching keys, canonical choice, or unchanged-source fallback.
     Raw source archives are untouched. Existing compact-table marker
-    substitution may run before or after this function.
+    substitution may run before or after this function. The optional baseline
+    payload mode requires the caller to create its private tracking table and
+    restore any remaining baseline payload before validation or publication.
     """
     if not isinstance(sql, str):
         raise CompactStorageError("compact storage requires SQL text")
+    if type(deferred_baseline_payload) is not bool:
+        raise CompactStorageError("deferred baseline payload option must be boolean")
     for marker in (_METADATA_BEGIN, _METADATA_END):
         _require_once(sql, marker, marker)
     if sql.index(_METADATA_BEGIN) >= sql.index(_METADATA_END):
@@ -402,4 +445,5 @@ def render_compact_sql(sql: str) -> str:
     )
     suffix = before_canonical + _CANONICAL_BEGIN + projection + joined + after_canonical
     rendered = prefix + _METADATA_BEGIN + metadata + _METADATA_END + suffix
-    return _reclaim_raw_records(_reclaim_completed_worktables(_defer_key_values(rendered)))
+    rendered = _reclaim_raw_records(_reclaim_completed_worktables(_defer_key_values(rendered)))
+    return _exclude_refreshed_baseline_payload(rendered) if deferred_baseline_payload else rendered

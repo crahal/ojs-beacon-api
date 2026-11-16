@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import sys
 import unittest
@@ -223,6 +224,13 @@ def logical_rows(server, database: str, table: str, columns=None, password=None)
 @unittest.skipUnless(MYSQL_AVAILABLE, "MySQL 8.4 server and client tools required")
 class CompactStorageEquivalenceTests(unittest.TestCase):
     def test_three_snapshot_history_matches_every_clean_table(self):
+        for page_kb in (8, 4):
+            with self.subTest(compressed_page_kb=page_kb), mock.patch.dict(
+                os.environ, {"OJS_MYSQL_COMPRESSED_PAGE_KB": str(page_kb)},
+            ):
+                self._check_three_snapshot_history_matches_every_clean_table()
+
+    def _check_three_snapshot_history_matches_every_clean_table(self):
         with TemporaryDirectory(prefix="ojs-compact-equivalence-") as directory, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             root = Path(directory)
@@ -258,6 +266,14 @@ class CompactStorageEquivalenceTests(unittest.TestCase):
                                 "SELECT ROW_FORMAT FROM information_schema.TABLES "
                                 f"WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME='records';",
                             ) == "Compressed", server.compact_storage)
+                            if server.compact_storage:
+                                self.assertIn(
+                                    "key_block_size=" + os.environ["OJS_MYSQL_COMPRESSED_PAGE_KB"],
+                                    server.execute(
+                                        "SELECT CREATE_OPTIONS FROM information_schema.TABLES "
+                                        f"WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME='records';",
+                                    ).lower(),
+                                )
                             prelude = run_pipeline.build_sql_prelude(
                                 snapshot=snapshot, source_sha256=source_hash,
                                 build_sql_sha256=build_hash, mysql_version=tools.version,

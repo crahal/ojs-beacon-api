@@ -170,6 +170,15 @@ class ComposeDefaultsTests(unittest.TestCase):
         self.assertEqual(self.environment["OJS_PUBLIC_BASE_URL"], "https://PUBLIC_IP")
         self.assertIn("replace", self.environment["MYSQL_ROOT_PASSWORD"])
 
+    def test_optional_clients_use_only_dedicated_readonly_directory(self):
+        api = self.service("ojs-api")
+        self.assertIn("OJS_API_CLIENTS_FILE: ${OJS_API_CLIENTS_FILE:-}", api)
+        self.assertIn("${OJS_API_CLIENTS_HOST_DIR:-./.secrets/api-clients}:/run/secrets/ojs-api-clients:ro", api)
+        self.assertEqual(self.environment["OJS_API_CLIENTS_FILE"], "")
+        self.assertEqual(self.environment["OJS_API_CLIENTS_HOST_DIR"], "./.secrets/api-clients")
+        self.assertNotIn("./.secrets:/", api)
+        self.assertNotIn(".local/", api)
+
     def test_make_sharing_targets_invoke_guard_and_exporter(self):
         text = (ROOT / "Makefile").read_text()
         for target, script in (("check-repository", "scripts/check_repository.py"),

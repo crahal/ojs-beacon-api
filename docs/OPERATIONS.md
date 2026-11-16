@@ -6,6 +6,13 @@ your public origin; examples are not production addresses. Preserve local
 configuration and data. Do not apply maintenance while a transfer, build,
 credential adoption or publication is advancing.
 
+For a reviewed migration from a 256 GiB data disk to a 512 GiB data disk, use
+the [disk-retirement runbook](DISK_RETIREMENT.md). It separates reversible
+detachment from irreversible deletion, with independent post-reboot API and
+history verification between them. Explicitly pause new work and wait for a
+graceful builder shutdown before beginning the maintenance window. An
+interrupted raw SQL import cannot resume at its byte counter.
+
 ## Routine checks
 
 ```bash
@@ -101,6 +108,41 @@ using configured scratch) `OJS_BUILD_SCRATCH_GB` in the private `.env`. See the
 Record a complete build's peak and allow growth headroom. Never equate the
 20 GiB minimum floor with enough space for the candidate. Re-run readiness
 after the current work finishes; it is only a point-in-time observation.
+
+### Reducing build space without changing the catalogue
+
+For a VM that must build beside its serving catalogue, an optional lean baseline
+import avoids retaining a second full copy of unchanged article XML while raw
+records and deduplication stages coexist. Start only a **new** reviewed build with
+`OJS_DEFER_BASELINE_PAYLOAD=1`; it requires a complete, checksummed predecessor
+export and compact storage. After work-table cleanup, `baseline-payload-hydration`
+restores the retained article payload in bounded batches. Byte comparisons,
+coverage checks and normal release validation must all pass before publication.
+Never delete the predecessor export while this work is running.
+
+`OJS_COMPRESS_EVENT_HISTORY=1` additionally compresses the candidate history
+table. It retains every event and does not alter delta semantics. These options
+do not convert or restart the live database. Test both logical parity and actual
+disk allocation on bounded representative samples before approving a budget;
+do not infer the whole build's capacity from an archive size or a tiny fixture.
+
+For a **new** compact build, `OJS_MYSQL_COMPRESSED_PAGE_KB=4` selects a denser
+InnoDB format. The default remains 8 KiB. Both raw records and the large imported
+history tables must use the selected layout: changing only the new-table SQL
+would leave the predecessor's embedded storage declarations unchanged.
+
+Before enabling it, test a bounded, representative sample with the exact MySQL
+patch used in production. Compare every column losslessly, check the actual
+InnoDB page size and allocated file sizes, and allow for raw tables, staging,
+indexes, undo, export and growth. Synthetic history tests cover unchanged data,
+updates, removals, restoration, merges and oversized Unicode payloads, but do
+not establish a whole-dataset space guarantee. Retain the disk and memory
+guards. Never lower the workspace budget just to pass readiness.
+
+The serving catalogue stays on its current layout throughout the build. A
+verified candidate is published through the normal guarded handover; there is
+no in-place conversion of the live database. An interrupted build must keep its
+recorded layout. Do not disable strict SQL checks to use smaller pages.
 
 ### Activate only after review
 
@@ -381,8 +423,19 @@ MySQL over a datadir upgraded by a newer server; use a compatible tested backup.
 
 ## Credential rotation
 
-The application has one shared HTTP Basic identity, not per-user accounts,
-self-service signup or a multi-key grace period. Rotate in a planned window:
+The original internal HTTP Basic identity is retained for monitoring and
+publication. Optional independently revocable clients are managed separately;
+see [tester access management](TESTER_ACCESS.md). Do not distribute or rotate
+the internal key just to invite a tester. There is no self-service signup.
+
+If the interim Caddy gateway is active, use its revocation procedure rather than
+the native JSON helper. Rotating the internal identity also requires updating
+the gateway's operator bcrypt entry and private upstream Authorization import
+in the same maintenance window, with validation and a graceful reload. Otherwise
+the gateway will forward the old key and all tester requests will fail. Never
+print or publish these private imports or expanded proxy configuration.
+
+To rotate the original internal identity, use a planned window:
 
 1. Pause updates and wait for publication/build activity to finish.
 2. Generate a new URL-safe key in a password manager. Edit only

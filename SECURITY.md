@@ -45,6 +45,21 @@ reproducible, not perpetually safe.
 - Do not mix the API client key, API database password, database root password,
   upstream credential, SSH key, email app password or optional OpenAI API key.
   Use separately generated values and rotate the affected credential if exposed.
+- Optional native tester accounts use independently generated 256-bit random keys;
+  only their SHA-256 digests, usernames, status and optional expiry reach the
+  API registry. These are random tokens, not human-chosen passwords. Do not
+  substitute memorable passwords: a fast digest is not a password-hardening
+  scheme. Revocation is checked on subsequent requests; it cannot cancel a
+  response already in progress. Preserve the internal monitoring identity.
+- The interim Caddy gateway instead stores tester bcrypt hashes and requires a
+  successful proxy reload for revocation. Native JSON revocation/expiry does not
+  apply in this mode. The proxy's injected internal Authorization value and
+  expanded/autosaved configuration are secrets: protect their file permissions
+  and restrict its admin API to an owner-private Unix socket. See
+  [tester access modes](docs/TESTER_ACCESS.md) before maintenance or migration.
+- Keep plaintext tester keys in owner-private local files, outside Git, Docker
+  contexts and deployment transfers. Send each invitation through an encrypted
+  private channel. Git ignore rules do not exclude cloud sync or backups.
 - Configuration files consumed as shell environment are trusted executable
   configuration. Keep them administrator-controlled; never source a contributed
   or downloaded `.env` blindly.

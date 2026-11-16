@@ -16,6 +16,22 @@ from pathlib import Path
 GIB = 1024 ** 3
 
 
+def scratch_reserve_gib(env: dict, default: float) -> float:
+    """A dedicated scratch filesystem can have its own explicit reserve.
+
+    If scratch shares the data filesystem, callers must use the larger reserve.
+    An unset value preserves the original shared-reserve policy.
+    """
+    value = env.get("OJS_SCRATCH_RESERVE_GB", "")
+    try:
+        reserve = float(value) if str(value).strip() else default
+        if not math.isfinite(reserve) or reserve < 0 or reserve * GIB >= 2**63:
+            raise ValueError
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("invalid scratch filesystem reserve") from None
+    return reserve
+
+
 def _budget(env: dict, name: str, blockers: list[str]) -> int:
     value = env.get(name, "")
     code = name.lower().removeprefix("ojs_")
@@ -51,11 +67,13 @@ def build_budget(*, clean: Path, raw: Path, scratch: Path | None, env: dict,
         raise ValueError("invalid build budget reserve")
     reserve = math.ceil(reserve_gib * GIB)
     minimum = math.ceil(minimum_gib * GIB)
-    locations = [("data", clean, workspace, 0), ("raw", raw, 0, download_bytes)]
+    locations = [("data", clean, workspace, 0, reserve),
+                 ("raw", raw, 0, download_bytes, reserve)]
     if scratch:
-        locations.append(("scratch", scratch, scratch_bytes, 0))
+        scratch_reserve = math.ceil(scratch_reserve_gib(env, reserve_gib) * GIB)
+        locations.append(("scratch", scratch, scratch_bytes, 0, scratch_reserve))
     filesystems: dict[int, dict] = {}
-    for role, path, working, incoming in locations:
+    for role, path, working, incoming, role_reserve in locations:
         try:
             if not path.is_dir() or path.is_symlink():
                 raise OSError
@@ -68,15 +86,16 @@ def build_budget(*, clean: Path, raw: Path, scratch: Path | None, env: dict,
             continue
         group = filesystems.setdefault(device, {
             "roles": [], "available_bytes": available, "working_bytes": 0,
-            "download_bytes": 0, "reserve_bytes": reserve,
+            "download_bytes": 0, "reserve_bytes": role_reserve,
         })
+        group["reserve_bytes"] = max(group["reserve_bytes"], role_reserve)
         group["roles"].append(role)
         group["available_bytes"] = min(group["available_bytes"], available)
         group["working_bytes"] += working
         group["download_bytes"] += incoming
     for group in filesystems.values():
         group["required_free_bytes"] = max(
-            minimum, group["working_bytes"] + group["download_bytes"] + reserve)
+            minimum, group["working_bytes"] + group["download_bytes"] + group["reserve_bytes"])
         group["enough_space"] = group["available_bytes"] >= group["required_free_bytes"]
         if not group["enough_space"]:
             blockers.append("insufficient_" + "_".join(group["roles"]) + "_space")

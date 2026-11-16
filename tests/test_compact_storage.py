@@ -109,6 +109,40 @@ class CompactStorageTests(unittest.TestCase):
     def setUpClass(cls):
         cls.sql = (PROJECT_ROOT / "sql" / "01_build_ojs_tables.sql").read_text(encoding="utf-8")
 
+    def test_deferred_baseline_mode_only_excludes_newly_owned_canonical_payload(self):
+        default = render_compact_sql(self.sql)
+        self.assertEqual(default, render_compact_sql(self.sql, deferred_baseline_payload=False))
+        rendered = render_compact_sql(self.sql, deferred_baseline_payload=True)
+        deletion = ("\nDELETE retained\nFROM ojs_pipeline_deferred_payload retained\n"
+                    "INNER JOIN ojs_stage_canonical_payload payload\n"
+                    "    ON payload.article_id = retained.article_id;\n")
+        self.assertEqual(rendered.count(deletion), 2)
+        self.assertEqual(rendered.replace(deletion, ""), default)
+        for ending in (
+            "INNER JOIN records r\n    ON r.id = staged.source_record_id;\n",
+            "WHERE staged.source_record_id IS NULL;\n",
+        ):
+            self.assertIn(ending + deletion, rendered)
+        self.assertEqual(canonical_values(rendered), canonical_values(default))
+        self.assertEqual(metadata_values(rendered), metadata_values(default))
+        # Tracking belongs to the importer/hydrator, not the SQL stage cleanup.
+        self.assertNotIn("CREATE TABLE ojs_pipeline_deferred_payload", rendered)
+        self.assertNotRegex(rendered, r"DROP TABLE(?: IF EXISTS)? ojs_pipeline_deferred_payload")
+        cleanup = rendered.split("SELECT 'OJS_PROGRESS_V1', 'stage', 'stage_cleanup';\n", 1)[1]
+        self.assertNotIn("ojs_pipeline_deferred_payload", cleanup)
+
+    def test_deferred_baseline_mode_rejects_ambiguous_existing_tracking(self):
+        for reference in ("ojs_pipeline_deferred_payload", "OJS_PIPELINE_DEFERRED_PAYLOAD"):
+            for statement in (f"SELECT * FROM {reference};\n",
+                              f"DROP TABLE IF EXISTS {reference};\n"):
+                with self.subTest(statement=statement), self.assertRaises(CompactStorageError):
+                    render_compact_sql(self.sql + statement, deferred_baseline_payload=True)
+
+    def test_deferred_baseline_mode_requires_a_real_boolean(self):
+        for value in (None, 0, 1, "0", "1", "true", []):
+            with self.subTest(value=value), self.assertRaises(CompactStorageError):
+                render_compact_sql(self.sql, deferred_baseline_payload=value)
+
     def test_only_payload_insert_values_are_deferred_and_identity_calculation_is_unchanged(self):
         original, original_normalization = metadata_values(self.sql)
         rendered, rendered_normalization = metadata_values(render_compact_sql(self.sql))
