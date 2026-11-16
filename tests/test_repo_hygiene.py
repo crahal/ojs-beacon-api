@@ -61,6 +61,13 @@ class ContentPolicyTests(unittest.TestCase):
         self.assertEqual(self.kinds("/home/" + "private-person/repository"), {"personal-home-path"})
         self.assertEqual(self.kinds("/Users/" + "private-person/repository"), {"personal-home-path"})
 
+    def test_only_exact_github_system_address_is_allowed(self):
+        self.assertEqual(self.kinds("noreply@github.com"), set())
+        for address in ("privateuser@" + "github.com", "support@" + "github.com",
+                        "noreply+private@" + "github.com", "noreply@" + "github.com.evil"):
+            with self.subTest(address=address):
+                self.assertEqual(self.kinds(address), {"non-example-email"})
+
     def test_ipv6_examples_allowed_real_addresses_flagged(self):
         self.assertEqual(self.kinds("https://[2001:db8::1]:443 ::1 ::"), set())
         for address in (":".join(("2606", "4700", "4700", "", "1111")), "fe80:" + ":abcd%eth0", "fd00:" + ":abcd"):
@@ -199,6 +206,12 @@ class GitInspectionTests(unittest.TestCase):
     def test_clean_example_history_passes(self):
         (self.root / "README.md").write_text("https://203.0.113.10 admin@example.org\n")
         self.commit("Start")
+        self.assertEqual(self.run_check("--history")[0], 0)
+
+    def test_github_system_committer_history_passes(self):
+        self.git("config", "user.email", "noreply@github.com")
+        (self.root / "README.md").write_text("public documentation\n")
+        self.commit("Synthetic automated dependency update")
         self.assertEqual(self.run_check("--history")[0], 0)
 
     def test_history_private_files_not_read(self):

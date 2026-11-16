@@ -170,6 +170,12 @@ the candidate, retains the old directory, switches/recreates containers, then
 performs authenticated health/provenance checks. A failed switch restores the
 previous release; interrupted switching is recovered through the journal.
 
+Cold validation checks the catalogue counts and source-to-identity consistency
+across the full dataset. On a small VM it can take hours even when transfer is
+complete. The later HTTP health-check timeout is not a time limit for this SQL
+validation. Follow the validation stage and measured CPU/I/O; do not bypass it
+or launch another publisher because the API is not serving yet.
+
 For a completed **credential-compatible** candidate, explicitly publish its
 date without downloading, rebuilding or pruning. This works while paused:
 
@@ -232,31 +238,81 @@ can use the completed-release handoff when its full package is present.
 
 ## Application and dependency upgrades
 
-1. Pause automatic work; wait for active transfer/build/publication and MySQL
-   shutdown to finish. Do not change files underneath an advancing worker.
+1. Pause automatic work; wait for active transfer/build/publication and its
+   native builder to finish. Leave the healthy serving MySQL running for an
+   API-only rollout. Do not change files underneath an advancing worker.
 2. Record the current Git revision, image IDs/digests, live snapshot, effective
    service drop-ins and backup verification. Keep private settings unchanged.
 3. Fetch/review a specific release or commit in a clean checkout. Inspect
    migrations and run the documented tests on representative fixtures first.
    Do not use `git reset --hard` to erase local operator changes.
-4. Apply the reviewed code using your deployment process, then run preflight,
-   `docker compose config --quiet`, and build the API image. Review service and
-   proxy template diffs rather than blindly reinstalling them.
-5. Recreate only the API for an API-only change; plan a separate stopped
-   maintenance window for MySQL version/schema changes. Validate authenticated
-   endpoints/history and external HTTPS afterwards.
+4. Build an explicitly tagged API image from that separate reviewed checkout.
+   Keep the deployment's private source/configuration intact; the image helper
+   neither installs source files nor changes the operational Git remote.
+5. Use the guarded image-only rollout below. Review service/proxy changes
+   separately; MySQL version/schema or credential changes need their own
+   maintenance plan. Check authenticated history and external HTTPS afterwards.
 6. Resume the scheduler only after health, capacity and backups are confirmed.
 
-For an API-only image/configuration change, with no publication active:
+### Roll out a prebuilt API image
+
+This workflow is for an **image-only** update after initial publication has
+finished successfully. It requires healthy existing MySQL/API containers,
+trusted public HTTPS, unchanged working credentials/configuration, a regular
+`data/.updates-paused` marker, existing workflow locks and no pending
+publication journal. It is not a first-deployment, source-upgrade, credential
+rotation or database-recovery command.
+
+Prepare a separate clean canonical checkout at `/srv/ojs-api-review`, owned
+by `ojs`, following [the contribution workflow](../CONTRIBUTING.md). Check out
+and test an explicit reviewed revision there. Do not copy private files into
+the image build context or overwrite the operational checkout. On the **VM**,
+build the local image from that reviewed source:
 
 ```bash
-sudo -u ojs -H bash -lc 'cd /srv/ojs_api && docker compose config --quiet && docker compose build ojs-api && docker compose up -d --no-deps --force-recreate ojs-api'
+sudo -u ojs -H bash -lc 'set -eu; cd /srv/ojs-api-review; git diff --quiet; git diff --cached --quiet; test -z "$(git ls-files --others --exclude-standard)"; git rev-parse HEAD; docker build --tag ojs-api:reviewed .'
 ```
 
-This causes a brief API interruption; it does not rebuild catalogue data.
-Use a retained previously tested image/code revision if this app-only upgrade
-fails. Do not downgrade MySQL binaries over a data directory upgraded by a newer
-server; restore a compatible backup through a reviewed plan instead.
+Confirm the displayed source revision is the one approved. Image building can
+consume resources; do it only with adequate headroom and no advancing
+publication/build. The following command uses the **already local** image and
+asks for all expected published snapshot dates, oldest first:
+
+```bash
+read -r -a OJS_EXPECTED_SNAPSHOTS -p 'All published snapshot dates, oldest first, separated by spaces: '
+OJS_IMAGE_CHECK_ARGS=()
+for OJS_DATE in "${OJS_EXPECTED_SNAPSHOTS[@]}"; do
+    OJS_IMAGE_CHECK_ARGS+=(--snapshot "$OJS_DATE")
+done
+if test "${#OJS_EXPECTED_SNAPSHOTS[@]}" -eq 0; then
+    printf 'No dates supplied; rollout not started.\n' >&2
+else
+    sudo -u ojs python3 -B /srv/ojs-api-review/scripts/update_api_image.py \
+      --project-root /srv/ojs_api --prebuilt-image ojs-api:reviewed \
+      --health-timeout 300 "${OJS_IMAGE_CHECK_ARGS[@]}"
+fi
+```
+
+The helper acquires the workflow locks, verifies baseline loopback/public
+authentication and history, retains a rollback tag for the old image, and
+recreates **only** the API with no build, pull or dependency restart. It verifies
+the selected image, unchanged MySQL identity/start time and unchanged catalogue
+metadata afterwards. A failed rollout attempts to restore and verify the old
+image; a failed rollback requires operator investigation. The 300-second value
+bounds individual health/wait operations, not the entire multi-step procedure.
+Expect a brief API interruption and keep the operator session connected until
+the command reports its result.
+
+Automatic updates stay paused. The old image's rollback tag is retained and
+references existing layers rather than making another copy of them. Keep it
+until acceptance, then review image retention separately; the helper performs
+no pruning. If the selected image is already running, it verifies health without
+recreating the container. This does not apply edited credentials or configuration.
+
+The helper never installs source files, rebuilds data, restarts MySQL or resumes
+scheduling. Apply any separately reviewed source/service updates through the
+private deployment workflow after active work is finished. Never downgrade
+MySQL over a datadir upgraded by a newer server; use a compatible tested backup.
 
 ## Credential rotation
 
@@ -267,10 +323,17 @@ self-service signup or a multi-key grace period. Rotate in a planned window:
 2. Generate a new URL-safe key in a password manager. Edit only
    `.secrets/api-client.env` privately as `ojs`; preserve its two expected keys,
    ownership and mode 600. Do not rerun the initial credential generator.
-3. Recreate only `ojs-api` with the API-only command above (a new inode from
-   an editor also needs the bind mount refreshed).
+3. In the separate credential-maintenance procedure, recreate only `ojs-api`
+   using the unchanged accepted image, without building/pulling it or restarting
+   MySQL. An editor's new inode also needs the bind mount refreshed. Keep an
+   approved private rollback copy of the old credential until verification.
 4. Verify the new identity succeeds and old credentials fail over trusted HTTPS;
    distribute the replacement securely, then resume approved operations.
+
+Do not use `update_api_image.py` for this rotation: its baseline check requires
+the existing credentials to work, and selecting the same image deliberately
+does not recreate the container. Rotation needs a separately reviewed procedure
+that protects its credential update and recreation from competing workflows.
 
 Do not confuse that key with Beacon authentication or the API's MySQL password.
 Changing `MYSQL_ROOT_PASSWORD` or `.secrets/db-api-password` alone does not update
